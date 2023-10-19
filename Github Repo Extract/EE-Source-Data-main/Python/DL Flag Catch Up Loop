@@ -1,0 +1,467 @@
+# Work in Progress
+# Recreating Tableau Data Source through Python, including calculated fields
+# Includes:
+# 	- Appeanding calcuated fields onto end of a Pandas Data Frame
+# 	- How to replicate FIXED calculation and append to DF
+# 	df['New Field Name'] = join.groupby('Fixed Field')['Target Field'].transform('Aggregate Function (min, max, etc)')
+# DB2 SQL Function not currently being used
+# User/Password for SQL Server query function have been removed
+
+import pandas as pd
+import pyodbc
+import datetime
+import os
+import openpyxl
+
+#################### Set Path ####################
+path = '//hmsdalfile/general/EE Source Data/Business Integrations/Data Lake Consumption/Python Reports/'
+full_path = path + datetime.datetime.today().strftime('%m-%d-%Y') + '/'
+if not os.path.exists(full_path):
+    os.mkdir(full_path)
+
+#report_date = datetime.datetime.today().strftime('%m/%d/%Y')
+#trending_date = datetime.datetime.today().strftime('%Y-%m-%d')
+full_info_file_name = 'DL File Info.csv'
+flag_file_name = 'DL Flag Info.csv'
+full_history_file_name = "Flag History Report Full.csv"
+latest_history_file_name = "Flag History Report Latest.csv"
+
+#################### Load Full History File ####################
+history_df = pd.read_csv(path + full_history_file_name, index_col=0)
+
+### Create History DF ###
+history_column_labels = ['DLFG_REC_INSERT_TIME', 'DLFG_ENTERPRISE_PARTNER_NAME', 'DLFG_GROUP_NAME', 'DLGC_GROUPING_ID',
+                         'DLFG_GROUP_LOADPROCESS', 'DLFC_GROUP_FREQUENCY', 'DLFG_FILE_GROUP_COUNT',
+                         'DLFX_B2B_FILE_PROFILE_NAME', 'EVENT_ID', 'B2B_PARTNER_NAME', 'PROFILE_NAME',
+                         'PARENT_PARTNER_NAME', 'PARENT_PARTNER_ABBR', 'PARENT_PARTNER_CODE', 'CHILD_PARTNER_NAME',
+                         'CHILD_PARTNER_ABBR', 'CHILD_PARTNER_CODE', 'FILE_REC_IN_DTM', 'DEST_FILE_NM',
+                         'Group_File_Status_Nm', 'Group_SLA_Status_Nm', 'Group_Status', 'Unique_Flag_ID',
+                         'Flag_Create_Date', 'Flag_Close_Date', 'Days_In_Issue_Type_1', 'Days_In_Issue_Type_2',
+                         'Days_In_Issue_Type_3', 'Days_In_Issue_Type_4', 'Days_In_Issue_Type_5', 'Total_Days',
+                         'Ticket_Created', 'Flag_Notes']
+
+#################### Flag Function ####################
+def unique_flag_id(data_frame):
+    if data_frame['Group_Status'] == 'Good':
+        return "None"
+    else:
+        group_id = str(data_frame['DLGC_GROUPING_ID'])
+        seq_num = str(data_frame['DLEFC_GROUPING_SEQ_NUMBER']).removesuffix('.0')
+        b2b_profile = str(data_frame['DLFX_B2B_FILE_PROFILE_NAME'])
+        event_id = str(data_frame['EVENT_ID_FROM_JSON']).removesuffix('.0')
+        flag_id = 'Group ID - ' + group_id + ' | Seq Number - ' + seq_num + ' | B2B Profile - ' + b2b_profile + \
+                  ' | JSON Event ID - ' + event_id
+        return flag_id
+
+#################### Comparison Codes ####################
+def old_issue_int(data_frame):
+    match data_frame['Group_Status_prev']:
+        case 'Issue Type 1':
+            return 1
+        case 'Issue Type 2':
+            return 2
+        case 'Issue Type 3':
+            return 3
+        case 'Issue Type 4':
+            return 4
+        case 'Issue Type 5':
+            return 5
+        case default:
+            return 0
+
+def new_issue_int(data_frame):
+    match data_frame['Group_Status_new']:
+        case 'Issue Type 1':
+            return 1
+        case 'Issue Type 2':
+            return 2
+        case 'Issue Type 3':
+            return 3
+        case 'Issue Type 4':
+            return 4
+        case 'Issue Type 5':
+            return 5
+        case default:
+            return 0
+
+def flag_create_dt(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 'None'
+    elif data_frame['Old_Issue_Int'] == 0 and data_frame['New_Issue_Int'] > 0:
+        return report_date
+    else:
+        return data_frame['Flag_Create_Date']
+
+def flag_close_date(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 'None'
+    elif data_frame['New_Issue_Int'] == 0 and data_frame['Old_Issue_Int'] > 0:
+        return report_date
+    else:
+        return 'None'
+
+def date_difference(data_frame):
+    if data_frame['Flag_Create_Date'] != 'None':
+        start_day = datetime.datetime.strptime(data_frame['Flag_Create_Date'],'%m/%d/%Y')
+        current_day = datetime.datetime.strptime(report_date,'%m/%d/%Y')
+
+        max_total_time = abs((current_day - start_day).days) + 1
+        listed_total_time = data_frame['Total_Days']
+
+        date_diff = max_total_time - listed_total_time
+
+        if str(date_diff) == 'nan':
+            date_diff = 0
+
+        return int(date_diff)
+    else:
+        return 0
+
+def days_in_issue_type_1(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 0
+    elif data_frame['New_Issue_Int'] == 1:
+        if data_frame['Flag_Create_Date'] == report_date:
+            return 1
+        else:
+            return data_frame['Days_In_Issue_Type_1'] + data_frame['Date_Difference']
+    elif data_frame['Flag_Create_Date'] == report_date:
+        return 0
+    elif data_frame['Flag_Close_Date'] == report_date and data_frame['Old_Issue_Int'] == 1:
+        return data_frame['Days_In_Issue_Type_1'] + data_frame['Date_Difference'] - 1
+    else:
+        return data_frame['Days_In_Issue_Type_1']
+
+def days_in_issue_type_2(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 0
+    elif data_frame['New_Issue_Int'] == 2:
+        if data_frame['Flag_Create_Date'] == report_date:
+            return 1
+        else:
+            return data_frame['Days_In_Issue_Type_2'] + data_frame['Date_Difference']
+    elif data_frame['Flag_Create_Date'] == report_date:
+        return 0
+    elif data_frame['Flag_Close_Date'] == report_date and data_frame['Old_Issue_Int'] == 2:
+        return data_frame['Days_In_Issue_Type_2'] + data_frame['Date_Difference'] - 1
+    else:
+        return data_frame['Days_In_Issue_Type_2']
+
+def days_in_issue_type_3(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 0
+    elif data_frame['New_Issue_Int'] == 3:
+        if data_frame['Flag_Create_Date'] == report_date:
+            return 1
+        else:
+            return data_frame['Days_In_Issue_Type_3'] + data_frame['Date_Difference']
+    elif data_frame['Flag_Create_Date'] == report_date:
+        return 0
+    elif data_frame['Flag_Close_Date'] == report_date and data_frame['Old_Issue_Int'] == 3:
+        return data_frame['Days_In_Issue_Type_3'] + data_frame['Date_Difference'] - 1
+    else:
+        return data_frame['Days_In_Issue_Type_3']
+
+def days_in_issue_type_4(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 0
+    elif data_frame['New_Issue_Int'] == 4:
+        if data_frame['Flag_Create_Date'] == report_date:
+            return 1
+        else:
+            return data_frame['Days_In_Issue_Type_4'] + data_frame['Date_Difference']
+    elif data_frame['Flag_Create_Date'] == report_date:
+        return 0
+    elif data_frame['Flag_Close_Date'] == report_date and data_frame['Old_Issue_Int'] == 4:
+        return data_frame['Days_In_Issue_Type_4'] + data_frame['Date_Difference'] - 1
+    else:
+        return data_frame['Days_In_Issue_Type_4']
+
+def days_in_issue_type_5(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return 0
+    elif data_frame['New_Issue_Int'] == 5:
+        if data_frame['Flag_Create_Date'] == report_date:
+            return 1
+        else:
+            return data_frame['Days_In_Issue_Type_5'] + data_frame['Date_Difference']
+    elif data_frame['Flag_Create_Date'] == report_date:
+        return 0
+    elif data_frame['Flag_Close_Date'] == report_date and data_frame['Old_Issue_Int'] == 5:
+        return data_frame['Days_In_Issue_Type_5'] + data_frame['Date_Difference'] - 1
+    else:
+        return data_frame['Days_In_Issue_Type_5']
+
+def ticket_created(data_frame):
+    if data_frame['Unique_Flag_ID'] == 'None':
+        return "False"
+    elif data_frame['Ticket_Created'] == 'True':
+        return data_frame['Ticket_Created']
+    else:
+        match data_frame['New_Issue_Int']:
+            case 0:
+                return "False"
+            case 1:
+                if data_frame['Total_Days'] >= 7:
+                    return "True"
+                else:
+                    return "False"
+            case 2:
+                if data_frame['Total_Days'] >= 6:
+                    return "True"
+                else:
+                    return "False"
+            case 3:
+                if data_frame['Total_Days'] >= 5:
+                    return "True"
+                else:
+                    return "False"
+            case 4:
+                if data_frame['Total_Days'] >= 1:
+                    return "True"
+                else:
+                    return "False"
+            case 5:
+                return "False"
+
+def flag_notes(data_frame):
+    old_flag_notes = data_frame['Flag_Notes']
+    if data_frame['Group_Status_new'] == 'Good':
+        return "None"
+    elif data_frame['Flag_Create_Date'] == report_date:
+        if data_frame['Ticket_Created'] == "True":
+            note_info = " , Ticket Created"
+        else:
+            note_info = ""
+        return str(report_date) + " New Flag - " + str(data_frame['Group_Status_new']) + note_info
+    elif data_frame['Flag_Close_Date'] != report_date:
+        new_issue = data_frame['New_Issue_Int']
+        old_issue = data_frame['Old_Issue_Int']
+
+        if (new_issue == 1 and data_frame['Total_Days'] == 7) or (
+                new_issue == 2 and data_frame['Total_Days'] == 6) \
+                or (new_issue == 3 and data_frame['Total_Days'] == 5) \
+                or (new_issue == 4 and data_frame['Total_Days'] == 1):
+            ticket_creation = "Ticket Created"
+        else:
+            ticket_creation = ""
+
+        if old_issue > new_issue:
+            issue_escalation = "Issue Deescalated to Issue Type " + str(data_frame['New_Issue_Int'])
+        elif old_issue < new_issue:
+            issue_escalation = "Issue Escalated to Issue Type " + str(data_frame['New_Issue_Int'])
+        else:
+            issue_escalation = ""
+
+        if str(data_frame['EVENT_ID_prev']) != str(data_frame['EVENT_ID_new']):
+            new_files = "New File Arrived"
+        else:
+            new_files = ""
+
+        if ticket_creation != "" or issue_escalation != "" or new_files != "":
+            strings = [ticket_creation, issue_escalation, new_files]
+            note_info = ', '.join(filter(None, strings))
+            return old_flag_notes + " | " + str(report_date) + " " + note_info
+        else:
+            return old_flag_notes
+    else:
+        return old_flag_notes + " | " + str(report_date) + ' Flag Closed'
+
+def new_files_note(data_frame):
+    note = data_frame['Note']
+    size = data_frame['size']
+
+    if note == 'New File Arrived' and size > 1:
+        note = str(size) + " New Files Arrived"
+
+    return note
+
+def flag_notes_updated(data_frame):  # Used for both Unique and Group Flags
+    note = data_frame['Flag_Notes']
+    if note != 'None':
+        list = note.split(" | ")
+        new_list = []
+        for n in list:
+            if ", " in n:
+                date, note = n.split(" ", 1)
+                note_list = note.split(", ")
+                for x in note_list:
+                    new_list.append([date, x])
+            else:
+                new_list.append(n.split(" ", 1))
+
+        column_names = ["Date", "Note"]
+        def_data_frame = pd.DataFrame(new_list, columns=column_names)
+        def_data_frame = def_data_frame.groupby(def_data_frame.columns.tolist(), as_index=False).size()
+
+        if data_frame['DLFG_FILE_GROUP_COUNT'] > 1:
+            def_data_frame['Note'] = def_data_frame.apply(new_files_note, axis=1)
+
+        def_data_frame.sort_values(by=["Note"], inplace=True)
+        def_data_frame['Note'] = def_data_frame.groupby('Date')['Note'].transform(lambda x: ', '.join(x))
+        def_data_frame.drop_duplicates(subset=column_names, keep='last', inplace=True)
+        def_data_frame['Date'] = pd.to_datetime(def_data_frame['Date']).dt.strftime("%m/%d/%Y")
+        def_data_frame.sort_values(by=["Date"], inplace=True)
+
+        if data_frame['Group_or_File_Level'] == 'Group':
+            def_data_frame['Date'] = def_data_frame.apply(note_date_update, axis=1)
+
+        def_data_frame = def_data_frame[column_names].copy()
+
+        note_string = def_data_frame.to_string(index=False, header=False)
+        note_string = note_string.replace("\n", " | ").strip()
+        note_string = " ".join(note_string.split())
+        return note_string
+    else:
+        return note
+
+### Start Loop ###
+d0 = datetime.date.today()
+d1 = datetime.date(2022, 9, 12)
+delta_1 = d0 - d1
+d2 = datetime.date(2022, 10, 16)
+delta_2 = d0 - d2
+print(delta_1.days)
+n_1 = int(delta_1.days) - 1
+n_original = int(delta_1.days)
+n_end = 0 #int(delta_2.days)
+
+while n_1 >= n_end:  # 7:
+    try:
+        #################### Load Current Summary File ####################
+        #n_1 = 0 #need to get 16th through 18th
+        current_day = datetime.datetime.today() + datetime.timedelta(days=-n_1)
+        report_date = current_day.strftime('%m/%d/%Y') ###############################Just for test use########################
+        current_files_full_path = path + current_day.strftime('%m-%d-%Y') + '/'
+        current_file_info_df = pd.read_csv(current_files_full_path + full_info_file_name,index_col=0)
+        print("Current Files: "+current_files_full_path + full_info_file_name)
+        current_file_info_df = current_file_info_df[current_file_info_df.DLFG_GROUP_ACTV_IND == "Y"]
+        current_file_info_df.drop_duplicates(inplace=True)
+
+        #################### Load Previous Summary File ####################
+        n_2 = n_1 + 1 #1
+        print(n_2)
+        print(n_original + 1)
+        while n_2 != (n_original + 1):
+            try:
+                previous_day = datetime.datetime.today() + datetime.timedelta(days=-n_2)
+                previous_files_full_path = path + previous_day.strftime('%m-%d-%Y') + '/'
+                previous_flag_info_df = pd.read_csv(previous_files_full_path + flag_file_name,index_col=0)
+                print("Previous Files: "+previous_files_full_path+flag_file_name)
+                date_diff = n_2 - n_1
+                n_2 = n_original + 1
+            except:
+                n_2 += 1
+
+        previous_flag_info_df.drop_duplicates(inplace=True)
+        previous_flag_info_full_df = previous_flag_info_df.copy()
+
+        #################### Add Flag Columns to Current File Info DF and create New Flag Info DF ####################
+        current_file_info_df['Unique_Flag_ID'] = current_file_info_df.apply(unique_flag_id, axis=1)
+        new_flag_info_df = current_file_info_df.copy()
+
+        #################### Drop Extra Columns from Flag DFs and remove Duplicates ####################
+        labels_to_drop = ['DLEGC_GROUPING_STATUS', 'DLEGC_GROUPING_CONSUMPTION_STATUS', 'DLEFC_GROUPING_LAST_DT',
+                          'DLFG_GROUP_CRE_USR', 'DLFG_REC_INSERT_TIME', 'DLFG_SINGLE_FILE_CONSUMPTION_INDICATOR',
+                          'File_SLA_Status_Cd', 'Group_SLA_Status_Cd', 'Group_SLA_Status_Nm', 'Max_Rec_Insert_Time',
+                          'New_Creation_Flag', 'Max_File_Count', 'EVENT_ORDER', 'DLFG_GROUP_ACTV_IND',
+                          'Profile_File_Status_Cd',
+                          'Group_File_Status_Cd', 'Group_File_Status_Nm', 'Group_Previously_Completed',
+                          'DLIC_B2B_FILE_PATTERN',
+                          'DLIC_DLK_FILE_DATA_TYPE']
+        new_flag_info_df.drop(labels=labels_to_drop, axis=1, inplace=True)
+        new_flag_info_df.drop_duplicates(inplace=True)
+        previous_flag_info_df.drop(labels=labels_to_drop, axis=1, inplace=True)
+        previous_flag_info_df.drop_duplicates(inplace=True)
+
+        #################### Determine Headers to Merge on and Create Merge DF ####################
+        merge_df = new_flag_info_df.merge(previous_flag_info_df, how='outer', on='Unique_Flag_ID',
+                                          suffixes=('_new', '_prev'),
+                                          indicator=False)
+        merge_df.drop_duplicates(inplace=True)
+        merge_df['DLFG_FILE_GROUP_COUNT'] = merge_df['DLFG_FILE_GROUP_COUNT_new']
+        merge_df['Run_Previously'] = "False"
+        merge_df['Group_or_File_Level'] = 'File'
+        #merge_df['Date_Difference'] = date_diff
+
+        ######################### Apply Functions and Update Calculated Columns #######################################
+        merge_df['Old_Issue_Int'] = merge_df.apply(old_issue_int, axis=1)
+        merge_df['New_Issue_Int'] = merge_df.apply(new_issue_int, axis=1)
+        merge_df['Flag_Create_Date'] = merge_df.apply(flag_create_dt, axis=1)
+        merge_df['Flag_Close_Date'] = merge_df.apply(flag_close_date, axis=1)
+        merge_df['Date_Difference'] = merge_df.apply(date_difference, axis=1)
+        merge_df['Days_In_Issue_Type_1'] = merge_df.apply(days_in_issue_type_1, axis=1).astype('Int64')
+        merge_df['Days_In_Issue_Type_2'] = merge_df.apply(days_in_issue_type_2, axis=1).astype('Int64')
+        merge_df['Days_In_Issue_Type_3'] = merge_df.apply(days_in_issue_type_3, axis=1).astype('Int64')
+        merge_df['Days_In_Issue_Type_4'] = merge_df.apply(days_in_issue_type_4, axis=1).astype('Int64')
+        merge_df['Days_In_Issue_Type_5'] = merge_df.apply(days_in_issue_type_5, axis=1).astype('Int64')
+        merge_df['Total_Days'] = merge_df['Days_In_Issue_Type_1'] + merge_df['Days_In_Issue_Type_2'] + \
+                                 merge_df['Days_In_Issue_Type_3'] + merge_df['Days_In_Issue_Type_4'] + \
+                                 merge_df['Days_In_Issue_Type_5']
+        merge_df['Ticket_Created'] = merge_df.apply(ticket_created, axis=1)
+        merge_df['Flag_Notes'] = merge_df['Flag_Notes'].astype(str)
+        merge_df['Flag_Notes'] = merge_df.apply(flag_notes, axis=1)
+        merge_df['Flag_Notes'] = merge_df['Flag_Notes'].astype(str)
+        print('Testing.... 1 2 3....')
+        merge_df['Flag_Notes'] = merge_df.apply(flag_notes_updated,
+                                                axis=1)  # Removes repeated notes, mostly in the case of multiple runs of the file
+        print('Functions Complete')
+
+        ######################### Move calculated fields to new DF #########################
+        labels = ['Unique_Flag_ID', "Flag_Create_Date", "Flag_Close_Date", "Days_In_Issue_Type_1",
+                  "Days_In_Issue_Type_2",
+                  "Days_In_Issue_Type_3", "Days_In_Issue_Type_4", "Days_In_Issue_Type_5", "Total_Days",
+                  "Ticket_Created", "Flag_Notes"]
+        results_df = merge_df[labels].copy()
+
+        ######################### Left Join calculated results back into Current File Info DF and Remove Good Status Types #########################
+        current_file_info_df = current_file_info_df.merge(results_df, how='left', on='Unique_Flag_ID')
+        current_file_info_df = current_file_info_df.loc[current_file_info_df['Group_Status'] != 'Good'].copy()
+        current_file_info_df.reset_index(drop=True, inplace=True)
+
+        ######################### Left Join New results to Previous Flag Info after dropping old results #########################
+        labels.remove('Unique_Flag_ID')  # Keep Unique Flag ID but Drop all other Calc Fields #
+        previous_flag_info_full_df.drop(labels=labels, axis=1, inplace=True)
+        previous_flag_info_full_df = previous_flag_info_full_df.merge(results_df, how='left', on='Unique_Flag_ID')
+        previous_flag_info_full_df.reset_index(drop=True, inplace=True)
+
+        # Export for Use
+        current_file_info_df.to_csv(current_files_full_path + flag_file_name)
+        previous_flag_info_full_df.to_csv(previous_files_full_path + flag_file_name)
+        print('Files Complete')
+
+        # Move needed columns to Flag History Slice DF
+        flag_history_slice_df = previous_flag_info_full_df[history_column_labels].copy()
+        flag_history_slice_df.drop_duplicates(inplace=True)
+
+        # Add Previous to History Dataframe
+        history_df = pd.concat([history_df, flag_history_slice_df])
+        history_df.drop_duplicates(subset=['Unique_Flag_ID', 'Flag_Create_Date', 'Flag_Notes'],
+                                   keep='last', inplace=True)
+
+        # Move needed columns to Flag History Slice DF
+        flag_history_slice_df = current_file_info_df[history_column_labels].copy()
+        flag_history_slice_df.drop_duplicates(inplace=True)
+
+        # Add Latest to History Dataframe
+        history_df = pd.concat([history_df, flag_history_slice_df])
+        history_df.drop_duplicates(subset=['Unique_Flag_ID', 'Flag_Create_Date', 'Flag_Notes'],
+                                   keep='last', inplace=True)
+        print('History Complete')
+
+        n_1 -= 1
+    except:
+       n_1 -= 1
+
+# Full History File
+history_df.reset_index(drop=True, inplace=True)
+history_df.to_csv(path + full_history_file_name)
+
+# Latest History File
+history_df.drop_duplicates(subset=['Unique_Flag_ID'], keep='last', inplace=True)
+history_df.reset_index(drop=True, inplace=True)
+history_df.to_csv(path + latest_history_file_name)
+
+print("Flags Added to History Files!")
+
+merge_df.to_csv(path + "Test Folder/Merge DF Function Export.csv")

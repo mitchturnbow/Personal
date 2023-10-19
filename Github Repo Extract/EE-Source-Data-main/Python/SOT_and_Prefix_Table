@@ -1,0 +1,1422 @@
+""" The purpose of this script is to offload the processing of the data behind the Source of Truth table (also known as
+the Source of True Knowledge, SOT_KNOWLEDGE, or SOT_K). With the integration of {discover} Policy Prefixes the
+processing power of SQL is not enough to create the table."""
+
+###############################
+# Import Statement
+import pandas as pd
+import pyodbc
+from itertools import combinations
+import datetime
+import numpy as np
+from tqdm import tqdm
+import re
+# import math
+
+
+###############################
+# Functions
+def execute_sql(sql: str, dsn: str = 'EDWPROD'):
+    with pyodbc.connect(DSN=dsn) as conn:
+        c = conn.cursor()
+        c.execute(sql)
+        row_count = '{:,}'.format(c.rowcount)
+        row_count = ' ' * (15 - len(row_count)) + row_count
+        print(f'Rows modified:{row_count}', end='\t')
+        conn.commit()
+        c.fetchall()
+
+
+def read_sql_to_df(sql: str, dsn: str = 'EDWPROD') -> pd.DataFrame:
+    conn = pyodbc.connect(dsn=dsn, autocommit=True, unicode_results=True)
+    res = pd.read_sql(sql=sql, con=conn)
+    conn.close()
+    return res
+
+
+def sot_knowledge_creation(discover: str = 'MED', known: str = 'RX', look_for_prefix: bool = True,
+                           blue_prefix_only: bool = True, allow_known_to_equal_discover: bool = False,
+                           include_dates: bool = True, num_emp_on_discover_min: int = 25,
+                           num_emp_on_discover_prefix_min: int = 25, self_ratio_max: float = 0.95,
+                           senior_ratio_max: float = 0.88, minor_ratio_max: float = 0.8,
+                           start_diff_ratio_max: float = 0.8, max_prefix_length: int = 3,
+                           days_for_cov_start_diff: int = 90, decimal_precision: int = 10):
+    """This is to create a Source of Truth Table based on the SOT Knowledge table created for Data Gaps. The goal is to
+     find the 'Minimum Maximum' information needed to Discover a potential carrier code for a coverage gap based on data
+     from Known carrier information (Carrier Code, Employer on Coverage Policy, and Group Number for Coverage Policy)
+     along with Insured State data for a different coverage type."""
+    # Check that the Discover and Known are viable and not the same
+    allowed_coverages = ['MED', 'RX', 'DENT', 'VIS']
+    if discover not in allowed_coverages:
+        raise ValueError(f'{discover} is not a valid Coverage Type for the variable: discover\n'
+                         f'The allowed list of Coverage Types is {allowed_coverages}.')
+
+    if known not in allowed_coverages:
+        raise ValueError(f'{known} is not a valid Coverage Type for the variable: known\n'
+                         f'The allowed list of Coverage Types is {allowed_coverages}.')
+
+    if known == discover:
+        raise ValueError(f'The variables known and discover must be different Coverage Types. Currently, both are '
+                         f'{known}.\nThe allowed list of Coverage Types is {allowed_coverages}.')
+
+    # Dictionaries for when certain carrier codes should equal something else.
+    # Note the KEY is the original code and the VALUE is the new carrier code
+    med_carrier_cd_is_other_dict = {'UHCBH': '65978'}
+    rx_carrier_cd_is_other_dict = {}
+    dent_carrier_cd_is_other_dict = {'UHCBH': '65978'}
+    vis_carrier_cd_is_other_dict = {}
+
+    # Carrier Code Dictionary for each Coverage Type
+    carrier_cd_is_other_dict = {'MED': med_carrier_cd_is_other_dict, 'RX': rx_carrier_cd_is_other_dict,
+                                'DENT': dent_carrier_cd_is_other_dict, 'VIS': vis_carrier_cd_is_other_dict}
+
+    # Set Group By Column Lists and Aggregate Dictionary
+    initial_group_by_columns = [f'{known}_CARRIER_CD', f'{known}_EMPLOYER', f'{known}_GROUP_NUM', 'INSURED_STATE_CD']
+    initial_discover_columns = [f'{discover}_CARRIER_CD']
+
+    if look_for_prefix:
+        initial_discover_columns.append(f'{discover}_POLICY_PREFIX')
+
+    all_group_by_columns = initial_discover_columns + initial_group_by_columns
+
+    # Create Combo List
+    group_by_combos_list = []
+    for r in range(len(initial_group_by_columns), 0, -1):
+        combinations_r = combinations(initial_group_by_columns, r)
+        group_by_combos_list.extend([list(tup) for tup in combinations_r])
+
+    agg_dict = {'SELF_CNT': 'sum', 'SENIOR_CNT': 'sum', 'MINOR_CNT': 'sum', 'START_DIFF_CNT': 'sum',
+                f'{known}_{discover}_SHARE_NUM': 'sum', 'RECORD_COUNT': 'sum'}
+
+    if include_dates:
+        agg_dict['MIN_START_DT'] = 'min'
+        agg_dict['MAX_START_DT'] = 'max'
+
+    # Random Variables
+    empty_str = '-NA-'  # Used to fill any empty strings, such as for no recommended next carrier
+    no_info_str = '-NOT PROVIDED-'  # Used to fill any empty provided information, such as Employer not being provided
+
+    ###############################
+    # Functions
+    def bcbs_carrier_cd_check(row):
+        carrier_code = row[f'{discover}_CARRIER_CD']
+
+        if re.match(r'(BC)|(BSC)|(USABL)', carrier_code):
+            return True
+        else:
+            return False
+
+    def format_object_as_string(df: pd.DataFrame):
+        column_list = list(df.columns)
+        for col in column_list:
+            if df.dtypes[col] == 'object':
+                df[col] = df[col].str.strip()
+
+        print('Formatting Complete!')
+        return df
+
+    def clean_prefixes_and_group_data_v2(df: pd.DataFrame):
+        def find_prefix_root(row, root_length: int):
+            string = str(row[f'NEW_{discover}_POLICY_PREFIX'])
+            length = len(string)
+
+            if length >= root_length:
+                return_string = string[:root_length]
+            else:
+                return_string = string
+
+            return return_string
+
+        def valid_prefix(row, replace_string: str = ''):
+            # Check if its being used in the check length function, if so, the 'row' will actually be the string
+            if replace_string != '':
+                return_string = replace_string
+            else:
+                return_string = str(row[f'{discover}_POLICY_PREFIX'])
+
+            if blue_prefix_only:
+                if not bcbs_carrier_cd_check(row):
+                    return_string = ''
+
+            # Check if a string has any bad characters, if so, return blank
+            if return_string != '':
+                if not re.match(r'^[0-9a-zA-Z]*$', return_string):
+                    return_string = ''
+                # Check if a string is all numbers
+                elif re.match(r'^[0-9]*$', return_string):
+                    return_string = ''
+                # Check if a string is one or more letters and then two or more numbers
+                elif re.match(r'^[a-zA-Z]+[0-9]+$', return_string):  # Originally r'^[a-zA-Z]+[0-9]{2,}$'
+                    # Check if the string should be cleaned or cut
+                    number = re.search(r'[0-9]+$', return_string).start()   # Originally r'^[a-zA-Z]+[0-9]{2,}$'
+                    return_string = return_string[0:number]
+                    if bcbs_carrier_cd_check(row) and len(return_string) < 3:
+                        return_string = ''
+
+            return return_string
+
+        def check_prefix_counts(row, root_length: int):
+            """Check that at least 1 root is either greater than or equal to the min prefixes
+            OR that it is 10% of one of the combos. If it is not, return blank, otherwise return the prefix."""
+            initial_string = str(row[f'NEW_{discover}_POLICY_PREFIX'])
+
+            if initial_string != '' and len(initial_string) >= root_length:
+                check_bln = False
+                for x in range(1, total_combos + 1):
+                    if row[f'COMBO_{x}_RECORD_COUNT_FOR_ROOT'] >= num_emp_on_discover_prefix_min \
+                            and row[f'COMBO_{x}_RATIO_FOR_ROOT'] >= 0.05:
+                        check_bln = True
+                        break
+
+                if check_bln:
+                    return_string = initial_string
+                elif bcbs_carrier_cd_check(row):
+                    if root_length <= 3:
+                        return_string = ''
+                    else:
+                        return_string = initial_string
+                elif root_length > 1:
+                    return_string = row[f'PREFIX_ROOT_PREVIOUS']
+                else:
+                    return_string = ''
+
+                if return_string != '':
+                    return_string = valid_prefix(row=row, replace_string=return_string)
+
+            else:
+                return_string = initial_string
+
+            return return_string
+
+        def clean_by_length(row):
+            if row[f'MAX_LENGTH_FOR_ROOT'] != row[f'PREFIX_LENGTH']:
+                return_string = ''
+            else:
+                return_string = row[f'NEW_{discover}_POLICY_PREFIX']
+            return return_string
+
+        def check_top_prefixes(row, ratio):
+            return_string = row[f'TOP_{discover}_PREFIX']
+            if row['CARRIER_OCCURRENCE'] > 1:
+                if row['OCCURRENCE_RATIO'] < ratio:
+                    return_string = ''
+            return return_string
+
+        def check_for_prefixes(df_inner):
+            if f'NEW_{discover}_POLICY_PREFIX' in df.columns:
+                keep_col = [f'{discover}_CARRIER_CD', f'NEW_{discover}_POLICY_PREFIX']
+            else:
+                keep_col = [f'{discover}_CARRIER_CD', f'{discover}_POLICY_PREFIX']
+            check_df = df_inner[keep_col].copy()
+            check_df.drop_duplicates(inplace=True)
+            check_df = check_df.loc[(check_df[keep_col[1]] != '')]
+            carrier_cds = check_df[keep_col[0]].values.tolist()
+            df_inner = df_inner[df_inner[keep_col[0]].isin(carrier_cds)]
+            return df_inner
+
+        print('Starting Prefix Cleaning...')
+        df[f'{discover}_POLICY_PREFIX'] = df.apply(valid_prefix, axis=1)
+        grouped_df = df.groupby(all_group_by_columns, as_index=False, dropna=False).agg(agg_dict)
+        print(f'{grouped_df.shape}')
+
+        # Prep the Dataframe for cleaning prefixes
+        limited_df = check_for_prefixes(grouped_df[all_group_by_columns + ['RECORD_COUNT']])
+
+        limited_df[f'{discover}_CARRIER_CD_SUM'] = limited_df.groupby([f'{discover}_CARRIER_CD']
+                                                                      )[f'RECORD_COUNT'].transform('sum')
+
+        # Create the New Prefix column
+        limited_df[f'NEW_{discover}_POLICY_PREFIX'] = limited_df[f'{discover}_POLICY_PREFIX']
+
+        # The idea for this is to find prefixes that are in the top 10 of a combo, preferably with 10+% of the
+        # population of a combo. If it is not in that 10% then it should be stripped down and checked again.
+        # Minimum prefix count still applies. Also, like in the first version, if the root is the same as another root
+        # within the same {discover} Carrier then it should be added back onto (or maybe just outright removed?).
+        # group_by_combos_list = generate_combinations(initial_group_by_columns)
+        total_combos = len(group_by_combos_list)
+
+        for i, combo_list in zip(range(1, total_combos + 1), group_by_combos_list):
+            group_by_columns = [f'{discover}_CARRIER_CD'] + combo_list
+            limited_df[f'COMBO_RECORD_COUNT_{i}'] = \
+                limited_df.groupby(group_by_columns)[f'RECORD_COUNT'].transform('sum')
+
+        limited_df.drop(limited_df[limited_df[f'{discover}_POLICY_PREFIX'] == ''].index, inplace=True)
+
+        orig_max_prefix_len = limited_df[f'{discover}_POLICY_PREFIX'].str.len().max()
+
+        for n in range(1, orig_max_prefix_len + 1):
+            limited_df[f'PREFIX_ROOT_CURRENT'] = limited_df.apply(find_prefix_root, root_length=n, axis=1)
+            for i, combo_list in zip(range(1, total_combos + 1), group_by_combos_list):
+                group_by_columns = [f'{discover}_CARRIER_CD', 'PREFIX_ROOT_CURRENT'] + combo_list
+                limited_df[f'COMBO_{i}_RECORD_COUNT_FOR_ROOT'] = limited_df.groupby(group_by_columns
+                                                                                    )[f'RECORD_COUNT'].transform('sum')
+                limited_df[f'COMBO_{i}_RATIO_FOR_ROOT'] = \
+                    round(limited_df[f'COMBO_{i}_RECORD_COUNT_FOR_ROOT'] / limited_df[f'COMBO_RECORD_COUNT_{i}'],
+                          decimal_precision)
+            limited_df[f'NEW_{discover}_POLICY_PREFIX'] = limited_df.apply(check_prefix_counts, root_length=n, axis=1)
+            limited_df[f'PREFIX_ROOT_PREVIOUS'] = limited_df[f'PREFIX_ROOT_CURRENT']
+            limited_df.drop(limited_df[limited_df[f'NEW_{discover}_POLICY_PREFIX'] == ''].index, inplace=True)
+        print(f"Done with Prefix Cleaning Loop\n")
+
+        # Prep for final dataframe
+        r_keep_columns = [f'{discover}_CARRIER_CD', f'{discover}_POLICY_PREFIX', f'NEW_{discover}_POLICY_PREFIX']
+        limited_df = limited_df.groupby(r_keep_columns + [f'{discover}_CARRIER_CD_SUM'], as_index=False, dropna=False
+                                        ).agg({'RECORD_COUNT': 'sum'})
+
+        # Keep the longest version of the prefix
+        temp_df = limited_df.groupby(initial_discover_columns, as_index=False, dropna=False
+                                     )[f'NEW_{discover}_POLICY_PREFIX'].agg(lambda x: max(x, key=len))
+        print(f'Shape of Paired Down DF: {limited_df.shape}\n'
+              f'Blanks in dataframe: {len(limited_df[limited_df[f"NEW_{discover}_POLICY_PREFIX"] == ""])}')
+        limited_df = limited_df[initial_discover_columns + [f'RECORD_COUNT', f'{discover}_CARRIER_CD_SUM']]
+        limited_df = limited_df.merge(right=temp_df[initial_discover_columns + [f'NEW_{discover}_POLICY_PREFIX']],
+                                      on=initial_discover_columns, how='left')
+        del temp_df
+
+        # Add something here to make longer prefixes where they share a base?
+        # Or remove them since they don't have something significant enough?
+        # --- Remove them as they aren't significant enough - Doesn't need to go to the max, one under the max is fine
+        new_max_prefix_len = limited_df[f'NEW_{discover}_POLICY_PREFIX'].str.len().max()
+        new_min_prefix_len = limited_df[f'NEW_{discover}_POLICY_PREFIX'].str.len().min()
+
+        if new_max_prefix_len != new_min_prefix_len:
+            limited_df[f'PREFIX_LENGTH'] = limited_df[f'NEW_{discover}_POLICY_PREFIX'].str.len()
+            for n in range(new_min_prefix_len, new_max_prefix_len):
+                limited_df[f'PREFIX_ROOT_CURRENT'] = limited_df.apply(find_prefix_root, root_length=n, axis=1)
+                limited_df[f'MAX_LENGTH_FOR_ROOT'] = limited_df.groupby([f'PREFIX_ROOT_CURRENT']
+                                                                        )[f'PREFIX_LENGTH'].transform('max')
+                limited_df[f'NEW_{discover}_POLICY_PREFIX'] = limited_df.apply(clean_by_length, axis=1)
+                limited_df.drop(limited_df[limited_df[f'NEW_{discover}_POLICY_PREFIX'] == ''].index, inplace=True)
+
+        limited_df = limited_df.groupby(r_keep_columns + [f'{discover}_CARRIER_CD_SUM'], as_index=False, dropna=False
+                                        ).agg({'RECORD_COUNT': 'sum'})
+
+        # Find the 'Most Popular' Prefix for each carrier
+        limited_df['OCCURRENCE_SUM'] = limited_df.groupby([f'{discover}_CARRIER_CD', f'NEW_{discover}_POLICY_PREFIX']
+                                                          )[f'RECORD_COUNT'].transform('sum')
+
+        top_df = limited_df.loc[(limited_df['OCCURRENCE_SUM'] != 0)]
+
+        # Drop Unneeded columns, rows, and rename prefix column
+        top_df = top_df[[f'{discover}_CARRIER_CD', f'NEW_{discover}_POLICY_PREFIX', 'OCCURRENCE_SUM',
+                         f'{discover}_CARRIER_CD_SUM']]
+        limited_df = limited_df[r_keep_columns]
+        top_df.drop_duplicates(inplace=True, ignore_index=True)
+        top_df.rename(columns={f'NEW_{discover}_POLICY_PREFIX': f'TOP_{discover}_PREFIX'}, inplace=True)
+
+        top_df['OCCURRENCE_RATIO'] = round(top_df['OCCURRENCE_SUM'] / top_df[f'{discover}_CARRIER_CD_SUM'],
+                                           decimal_precision)
+        top_df['MAX_PREFIX_RATIO'] = top_df.groupby([f'{discover}_CARRIER_CD']
+                                                    )['OCCURRENCE_RATIO'].transform('max')
+        top_df = top_df.loc[(top_df['MAX_PREFIX_RATIO'] == top_df['OCCURRENCE_RATIO'])]
+        
+        # Check if a Carrier has multiple 'top' prefixes
+        top_df['CARRIER_OCCURRENCE'] = top_df.groupby(f'{discover}_CARRIER_CD'
+                                                      )[f'{discover}_CARRIER_CD'].transform('count')
+        prefix_ratio = 0.2
+
+        while any(top_df['CARRIER_OCCURRENCE'] > 1) and prefix_ratio <= 0.51:
+            top_df[f'TOP_{discover}_PREFIX'] = top_df.apply(check_top_prefixes, ratio=prefix_ratio, axis=1)
+            top_df = top_df[top_df[f'TOP_{discover}_PREFIX'] != '']
+            top_df['CARRIER_OCCURRENCE'] = top_df.groupby(f'{discover}_CARRIER_CD'
+                                                          )[f'{discover}_CARRIER_CD'].transform('count')
+            prefix_ratio += 0.01
+
+        if any(top_df['CARRIER_OCCURRENCE'] > 1):
+            print(f'{top_df.shape}\n\nERROR: Multiple Top Prefixes even though ratio is set to {prefix_ratio}!')
+            exit()
+
+        top_df = top_df[[f'{discover}_CARRIER_CD', f'TOP_{discover}_PREFIX']]
+
+        print(f'Blanks in dataframe: {len(limited_df[limited_df[f"NEW_{discover}_POLICY_PREFIX"] == ""])}\n')
+
+        # Merge the limited (prefix) dataframe with the full dataframe, dropping the old prefix column
+        print(f'Shape of 1st DF: {limited_df.shape}\nShape of 2nd DF: {grouped_df.shape}\n')
+        intermittent_df = grouped_df.merge(right=limited_df, on=initial_discover_columns, how='left')
+        intermittent_df.drop(columns=[f'{discover}_POLICY_PREFIX'], inplace=True)
+        intermittent_df.rename(columns={f'NEW_{discover}_POLICY_PREFIX': f'{discover}_POLICY_PREFIX'}, inplace=True)
+        intermittent_df.fillna('', inplace=True)
+        print(f'Shape of Combined DF: {intermittent_df.shape}')
+
+        # Get the final dataframe by aggregating the data in the prior merged dataframe
+        final_df = intermittent_df.groupby(all_group_by_columns, as_index=False, dropna=False).agg(agg_dict)
+        print(f'Shape of Aggregated DF before Top:{final_df.shape}')
+        final_df = final_df.merge(top_df, on=[f'{discover}_CARRIER_CD'], how='left')
+        print(f'Shape of Aggregated DF After Top:{final_df.shape}')
+        final_df.fillna(f'{empty_str}', inplace=True)
+
+        return final_df
+
+    def collect_all_data():
+        start_time = datetime.datetime.now()
+        discover_carriers_df = read_sql_to_df(sql=sql_for_carriers())
+        print(f'{discover} Carriers:\n{discover_carriers_df}\n')
+
+        total_merge_time = None
+        total_query_time = None
+        total_clean_time = None
+
+        min_records_on_sql = 50000000
+        max_index = discover_carriers_df.shape[0] - 1
+        record_count = 0
+        discover_carriers_string = ''
+        add_on_df = pd.DataFrame()
+        internal_data_df = pd.DataFrame()
+
+        for index, row in tqdm(discover_carriers_df.iterrows(), desc=f'Collecting Data', leave=False,
+                               total=discover_carriers_df.shape[0]):
+            carrier = row[f'{discover}_CARRIER_CD']
+            discover_carrier = f"'{carrier}'"
+
+            if carrier in carrier_cd_is_other_dict[discover].values():
+                keys = [k for k, v in carrier_cd_is_other_dict[discover].items() if v == carrier]
+                for k in keys:
+                    discover_carrier += f", '{k}'"
+
+            if record_count == 0:
+                discover_carriers_string = discover_carrier
+                record_count = row[f'TOTAL_RECORDS']
+            else:
+                discover_carriers_string += f', {discover_carrier}'
+                record_count += row[f'TOTAL_RECORDS']
+
+            if record_count >= min_records_on_sql or index == max_index:
+                print(f'\nCarriers for Run: {discover_carriers_string}\n')
+                sql_for_emp_data = sql_for_data(discover_carriers_string)
+                print(f'\n\n\n\n{sql_for_emp_data}\n\n\n\n\n')
+
+                if internal_data_df.empty:
+                    start_time_query = datetime.datetime.now()
+                    internal_data_df = read_sql_to_df(sql=sql_for_emp_data)
+                    total_query_time = datetime.datetime.now() - start_time_query
+                    print(f'Query Time: {datetime.datetime.now() - start_time_query}')
+                    print(f'internal_data_df Current Size: {internal_data_df.shape}')  # \n{internal_data_df.dtypes}\n')
+                    internal_data_df = format_object_as_string(internal_data_df)
+                    print(f'\n{internal_data_df.dtypes}\n')
+
+                    if look_for_prefix:
+                        start_clean_time = datetime.datetime.now()
+                        internal_data_df = clean_prefixes_and_group_data_v2(internal_data_df)
+                        total_clean_time = datetime.datetime.now() - start_clean_time
+                        print(f'Prefix Cleaning Time: {datetime.datetime.now() - start_clean_time}')
+                    print(f'\nFirst Dataframe created! Current Size: {internal_data_df.shape}\n')
+
+                else:
+                    start_time_query = datetime.datetime.now()
+                    add_on_df = read_sql_to_df(sql=sql_for_emp_data)
+                    total_query_time += datetime.datetime.now() - start_time_query
+                    print(f'Query Time: {datetime.datetime.now() - start_time_query}')
+                    print(f'add_on_df Current Size: {add_on_df.shape}\n')
+                    add_on_df = format_object_as_string(add_on_df)
+
+                    if look_for_prefix:
+                        start_clean_time = datetime.datetime.now()
+                        add_on_df = clean_prefixes_and_group_data_v2(add_on_df)
+                        total_clean_time += datetime.datetime.now() - start_clean_time
+                        print(f'Prefix Cleaning Time: {datetime.datetime.now() - start_clean_time}')
+
+                discover_carriers_string = ''
+                record_count = 0
+
+                if not add_on_df.empty:
+                    print(f'\nMerging Dataframes...')
+                    print(f'Shape of internal: {internal_data_df.shape}\nShape of add on: {add_on_df.shape}\n')
+                    start_time_merge = datetime.datetime.now()
+                    internal_data_df = pd.concat([internal_data_df, add_on_df], ignore_index=True, axis=0)
+                    if total_merge_time is None:
+                        total_merge_time = datetime.datetime.now() - start_time_merge
+                    else:
+                        total_merge_time += datetime.datetime.now() - start_time_merge
+                    print(f'Merge Time: {datetime.datetime.now() - start_time_merge}')
+                    print(f'Dataframes merged! Current Size: {internal_data_df.shape}\n')
+                if index == max_index:
+                    print('\nAll Data Collected!!!\n')
+
+        print(f'Data Collection Time: {datetime.datetime.now() - start_time}\n'
+              f'Total Query Time: {total_query_time}\n'
+              f'Total Prefix Cleaning Time: {total_clean_time}\n'
+              f'Total Merge Time: {total_merge_time}\n')
+
+        return internal_data_df
+
+    def multi_col_dense_rank_v2(df: pd.DataFrame, rank_columns: list, rank_name: str = 'RANK',
+                                additional_group_by_col: list = [], remove_all_but_best: bool = False):
+
+        start_time = datetime.datetime.now()
+
+        # Create list of columns to rank by IN ORDER
+        if additional_group_by_col is not None:
+            jigsaw_group_by_columns = additional_group_by_col + initial_group_by_columns.copy()
+        else:
+            jigsaw_group_by_columns = initial_group_by_columns.copy()
+
+        if remove_all_but_best:
+            for column_name in rank_columns:
+                df[f'{rank_name}'] = df.groupby(jigsaw_group_by_columns)[column_name].rank(method='dense',
+                                                                                               ascending=False)
+                df.drop(df[df[f'{rank_name}'] != 1].index, inplace=True)
+
+            df.drop(columns=[f'{rank_name}'], inplace=True)
+
+        else:
+            # Loop to create multiple column ranks
+            for column_name, n in zip(rank_columns, range(len(rank_columns))):
+                df[f'{rank_name}_{n}'] = df.groupby(jigsaw_group_by_columns)[column_name].rank(method='dense',
+                                                                                                   ascending=False)
+                jigsaw_group_by_columns.append(f'{rank_name}_{n}')
+            # Loop to create column to rank by
+            df[f'{rank_name}_SUM'] = 0
+            for n, power in zip(range(len(rank_columns)), range(len(rank_columns), 0, -1)):
+                df[f'{rank_name}_SUM'] += df[f'{rank_name}_{n}'] ** power
+                df.drop(columns=[f'{rank_name}_{n}'], inplace=True)
+
+            # Recreate rank by columns list
+            if additional_group_by_col is not None:
+                refreshed_rank_columns = additional_group_by_col + initial_group_by_columns.copy()
+            else:
+                refreshed_rank_columns = initial_group_by_columns.copy()
+
+            # Rank Overall and drop SUM column
+            df[f'{rank_name}'] = df.groupby(refreshed_rank_columns)[f'{rank_name}_SUM'].rank(method='dense',
+                                                                                                     ascending=True)
+            df.drop(columns=[f'{rank_name}_SUM'], inplace=True)
+
+        print(f'Dense Rank Time: {datetime.datetime.now() - start_time}')
+
+        return df
+
+    def multi_col_dense_rank_v4(df: pd.DataFrame, rank_columns: list, rank_name: str = 'RANK',
+                                additional_group_by_col: list = None, remove_all_but_best: bool = False):
+        def multi_dense_rank(group):
+            def internal_rank(row, col_list: list, max_count: int):
+                if row[f'{col_list[0]}_min'] == row[f'{col_list[0]}_max']:
+                    rank = row[f'{col_list[0]}_min']
+                else:
+                    possible_rank_list = [*range(row[f'{col_list[0]}_min'], row[f'{col_list[0]}_max'] + 1)]
+                    check_range = range(len(possible_rank_list))
+
+                    for x in col_list[1:]:
+                        for n in check_range:
+                            if row[x] != n + 1:
+                                del possible_rank_list[0]
+                            else:
+                                break
+                        if len(possible_rank_list) == 1:
+                            break
+
+                    rank = possible_rank_list[0]
+                    
+                return rank
+
+            rank_df = pd.DataFrame()
+            for tup, columns_df in group:
+                group_by_count = columns_df.shape[0]
+
+                if group_by_count > 1:
+                    columns_df['base'] = 'A'
+                    inner_group_col = ['base']
+                    rank_column_list = []
+                    for col, cnt in zip(rank_columns, range(len(rank_columns))):
+                        if cnt == 0:
+                            columns_df[f'{rank_name}_{cnt}_min'] = columns_df.groupby(
+                                inner_group_col)[col].rank(method='min', ascending=False).astype('int')
+                            columns_df[f'{rank_name}_{cnt}_max'] = columns_df.groupby(
+                                inner_group_col)[col].rank(method='max', ascending=False).astype('int')
+
+                        else:
+                            columns_df[f'{rank_name}_{cnt}'] = columns_df.groupby(
+                                inner_group_col)[col].rank(method='min', ascending=False).astype('int')
+
+                        inner_group_col.append(col)
+                        rank_column_list.append(f'{rank_name}_{cnt}')
+                        current_group_count = columns_df.groupby(inner_group_col)[inner_group_col].count()
+                        if not any(current_group_count > 1):
+                            break
+
+                    # Rank based on all columns
+                    columns_df['Rank'] = columns_df.apply(internal_rank, col_list=rank_column_list,
+                                                          max_count=group_by_count, axis=1)
+
+                else:
+                    columns_df['Rank'] = 1
+
+                if rank_df.empty:
+                    rank_df = columns_df['Rank']
+                else:
+                    rank_df = pd.concat([rank_df, columns_df['Rank']])
+
+            return rank_df
+
+        start_time = datetime.datetime.now()
+
+        # Create list of columns to rank by IN ORDER
+        if additional_group_by_col is not None:
+            jigsaw_group_by_columns = additional_group_by_col + initial_group_by_columns[:]
+        else:
+            jigsaw_group_by_columns = initial_group_by_columns[:]
+        
+        if remove_all_but_best:
+            for column_name in rank_columns:
+                df[f'{rank_name}'] = df.groupby(jigsaw_group_by_columns)[column_name].rank(method='min',
+                                                                                           ascending=False)
+                df.drop(df[df[f'{rank_name}'] != 1].index, inplace=True)
+
+            df.drop(columns=[f'{rank_name}'], inplace=True)
+
+        else:
+            print(f'Rank by... {rank_columns}\nAvailable columns? {df.columns}\n')
+            df[f'{rank_name}'] = multi_dense_rank(df.groupby(jigsaw_group_by_columns)[rank_columns])
+
+            # Ensure that the Rank is Dense
+            df[f'{rank_name}'] = df.groupby(jigsaw_group_by_columns)[f'{rank_name}'].rank(method='dense',
+                                                                                          ascending=True)
+
+        print(f'Dense Rank Time: {datetime.datetime.now() - start_time}')
+
+        return df
+
+    def multi_col_dense_rank_v5(df: pd.DataFrame, rank_columns: list, rank_name: str = 'RANK',
+                                additional_group_by_col: list = None, remove_all_but_best: bool = False):
+        def multi_dense_rank(group):
+            def internal_rank(row, col_list: list, max_count: int):
+                if row[f'{col_list[0]}_min'] == row[f'{col_list[0]}_max']:
+                    rank = row[f'{col_list[0]}_min']
+                else:
+                    possible_rank_list = [*range(row[f'{col_list[0]}_min'], row[f'{col_list[0]}_max'] + 1)]
+                    check_range = range(len(possible_rank_list))
+
+                    for x in col_list[1:]:
+                        for n in check_range:
+                            if row[x] != n + 1:
+                                del possible_rank_list[0]
+                            else:
+                                break
+                        if len(possible_rank_list) == 1:
+                            break
+
+                    rank = possible_rank_list[0]
+
+                return rank
+            
+            rank_df = pd.DataFrame()
+            for tup, columns_df in group:
+                group_by_count = columns_df.shape[0]
+                removed_df = pd.DataFrame()
+                if group_by_count > 1:
+                    columns_df['base'] = 'A'
+                    inner_group_col = ['base']
+                    rank_column_list = []
+                    for col, cnt in zip(rank_columns, range(len(rank_columns))):
+                        if remove_all_but_best:
+                            columns_df['Rank'] = columns_df.groupby(
+                                inner_group_col)[col].rank(method='min', ascending=False).astype('int')
+                            if removed_df.empty:
+                                removed_df = columns_df['Rank'].loc[(columns_df['Rank'] != 1)]
+                            else:
+                                removed_df = pd.concat([removed_df, columns_df['Rank'].loc[(columns_df['Rank'] != 1)]])
+                            columns_df.drop(columns_df[columns_df['Rank'] != 1].index, inplace=True)
+                            group_by_count = columns_df.shape[0]
+                            if group_by_count == 1:
+                                break
+
+                        else:
+                            if cnt == 0:
+                                columns_df[f'Rank_{cnt}_min'] = columns_df.groupby(
+                                    inner_group_col)[col].rank(method='min', ascending=False).astype('int')
+                                columns_df[f'Rank_{cnt}_max'] = columns_df.groupby(
+                                    inner_group_col)[col].rank(method='max', ascending=False).astype('int')
+                            else:
+                                columns_df[f'Rank_{cnt}'] = columns_df.groupby(
+                                    inner_group_col)[col].rank(method='min', ascending=False).astype('int')
+
+                            inner_group_col.append(col)
+                            rank_column_list.append(f'Rank_{cnt}')
+                            current_group_count = columns_df.groupby(inner_group_col)[inner_group_col].count()
+                            if not any(current_group_count > 1):
+                                break
+
+                    if not remove_all_but_best:
+                        columns_df['Rank'] = columns_df.apply(internal_rank, col_list=rank_column_list,
+                                                              max_count=group_by_count, axis=1)
+                else:
+                    columns_df['Rank'] = 1
+
+                if rank_df.empty:
+                    rank_df = columns_df['Rank']
+                else:
+                    rank_df = pd.concat([rank_df, columns_df['Rank']])
+                
+                if remove_all_but_best and not removed_df.empty:
+                    rank_df = pd.concat([rank_df, removed_df])
+
+            return rank_df
+
+        start_time = datetime.datetime.now()
+
+        # Create list of columns to rank by IN ORDER
+        if additional_group_by_col is not None:
+            jigsaw_group_by_columns = additional_group_by_col + initial_group_by_columns.copy()
+        else:
+            jigsaw_group_by_columns = initial_group_by_columns.copy()
+
+        if remove_all_but_best:
+            # Get Initial Ranks and Clear any that are not 1
+            df[f'{rank_name}'] = df.groupby(jigsaw_group_by_columns)[rank_columns[0]].rank(method='min',
+                                                                                           ascending=False
+                                                                                           ).astype('int')
+            df.drop(df[df[f'{rank_name}'] != 1].index, inplace=True)
+
+            # Do Multi Col Rank then Clear any that are not 1
+            df[f'{rank_name}'] = multi_dense_rank(df.groupby(jigsaw_group_by_columns)[rank_columns])
+            df.drop(df[df[f'{rank_name}'] != 1].index, inplace=True)
+            df.drop(columns=[f'{rank_name}'], inplace=True)
+
+        else:
+            print(f'Rank by... {rank_columns}\nAvailable columns? {df.columns}\n')
+            df[f'{rank_name}'] = multi_dense_rank(df.groupby(jigsaw_group_by_columns)[rank_columns])
+
+            # Ensure that the Rank is Dense
+            df[f'{rank_name}'] = df.groupby(jigsaw_group_by_columns)[f'{rank_name}'].rank(method='dense',
+                                                                                          ascending=True)
+
+        print(f'Dense Rank Time: {datetime.datetime.now() - start_time}')
+
+        return df
+
+    def group_data_with_rank(df: pd.DataFrame):
+        """This function, along with the inner functions, takes all the data and creates the layers for the SOT table,
+        ranks them, and removes any lines that either don't meet needed standards, set in the outermost function
+        variables or the user, or are not the best combinations to use for a set of data."""
+        def group_data_inner(group_by_columns: list):
+            def next_info(row, prefix_info: bool = False, show_indv: bool = True, show_policy_share: bool = True):
+                if prefix_info:
+                    return_string = f"PERCENT ON PREFIX: {row[f'PER_EMP_ON_{discover}_PREFIX']:.2f}%"
+                    if show_indv:
+                        return_string += f" | NUM INDIVIDUALS ON PREFIX: {row[f'NUM_EMP_ON_{discover}_PREFIX']:.0f}"
+                    if show_policy_share:
+                        return_string += f" | PERCENT POLICY SHARE ON PREFIX: " \
+                                         f"{row[f'{known}_{discover}_POLICY_SHARE_ON_PREFIX']:.0f}"
+                else:
+                    return_string = f"PERCENT ON {discover}: {row[f'PER_EMP_ON_{discover}']:.2f}%"
+                    if show_indv:
+                        return_string += f" | NUM INDIVIDUALS ON {discover}: {row[f'NUM_EMP_ON_{discover}']:.0f} "
+                    if show_policy_share:
+                        return_string += f"| PERCENT {discover}-{known} POLICY SHARE: " \
+                                         f"{row[f'{known}_{discover}_POLICY_SHARE']:.0f}"
+
+                    if look_for_prefix:
+                        return_string += f" || PERCENT ON PREFIX: {row[f'PER_EMP_ON_{discover}_PREFIX']:.2f}%"
+                        if show_indv:
+                            return_string += f" | NUM INDIVIDUALS ON PREFIX: {row[f'NUM_EMP_ON_{discover}_PREFIX']:.0f}"
+                        if show_policy_share:
+                            return_string += f" | PERCENT {discover}-{known} POLICY SHARE ON PREFIX: " \
+                                             f"{row[f'{known}_{discover}_POLICY_SHARE_ON_PREFIX']:.0f}"
+                return return_string
+            
+            # Create a copy of the dataframe to manipulate and determine the column selection
+            df_new = df.copy()
+            print(f'Size of DataFrame at start of group_data_inner:{df_new.shape}')
+
+            # Determine the column selection length and priority
+            column_selection_str = ''
+            priority = 3
+            if f'{known}_CARRIER_CD' in group_by_columns:
+                column_selection_str += 'C'
+                priority -= 2
+            if f'{known}_EMPLOYER' in group_by_columns:
+                column_selection_str += 'E'
+                priority -= 0
+            if f'{known}_GROUP_NUM' in group_by_columns:
+                column_selection_str += 'G'
+                priority -= 0
+            if 'INSURED_STATE_CD' in group_by_columns:
+                column_selection_str += 'S'
+                priority -= 1
+            df_new[f'COLUMN_SELECTION'] = column_selection_str
+            df_new[f'COLUMN_SELECTION_LENGTH'] = len(column_selection_str)
+            df_new[f'COLUMN_SELECTION_PRIORITY'] = priority
+            #   The above will cause it to choose the LONGER item if there is dispute at the end
+            # len(initial_group_by_columns) - len(column_selection_str)
+            #   The above would cause it to choose the SHORTER item if there is dispute at the end - ORIGINAL METHOD
+            # ORIGINAL SOT K chose the SHORTER item.... not sure about changing it as part of the idea was to chose
+            #   essentially the least common denominator. Testing with the LONGER item with the idea that if two
+            #   (or more) things are the same, then maybe it needs the additional information to be properly defined.
+            #   Again, not sure about changing this up...
+            # NOTE: Doing this does cause there to be fewer rows on the table, but could potentially make it less
+            #   flexible. Discuss this with Aron and see what he thinks...
+            # Thoughts.... I basically want this to show the most 'unique' combo possible.
+            #   Maybe have some kind of uniqueness score for the second to last ranking? Pick the thing with the
+            #   lowest uniqueness score and the longest column selection if there is still more than one???
+
+            # Determine how many people are in the group
+            df_new[f'NUM_EMP_TOTAL'] = df.groupby(group_by_columns)[f'RECORD_COUNT'].transform('sum')
+
+            print(f'Size of DataFrame before Calculations & Removals:{df_new.shape}')
+
+            # Determine how many people have the same {discover} cd in the group and calculate related columns
+            group_by_columns = [f'{discover}_CARRIER_CD'] + group_by_columns
+
+            df_new[f'NUM_EMP_ON_{discover}'] = df.groupby(group_by_columns)[f'RECORD_COUNT'].transform('sum')
+            df_new = df_new.loc[(df_new[f'NUM_EMP_ON_{discover}'] >= num_emp_on_discover_min)]
+            df_new.dropna(inplace=True)
+
+            df_new[f'SELF_CNT'] = df.groupby(group_by_columns)[f'SELF_CNT'].transform('sum')
+            df_new = df_new.loc[(round(df_new[f'SELF_CNT']/df_new[f'NUM_EMP_ON_{discover}'], decimal_precision)
+                                 <= self_ratio_max)]
+            df_new.dropna(inplace=True)
+
+            df_new[f'SENIOR_CNT'] = df.groupby(group_by_columns)[f'SENIOR_CNT'].transform('sum')
+            df_new = df_new.loc[(round(df_new[f'SENIOR_CNT']/df_new[f'NUM_EMP_ON_{discover}'], decimal_precision)
+                                 <= senior_ratio_max)]
+            df_new.dropna(inplace=True)
+
+            df_new[f'MINOR_CNT'] = df.groupby(group_by_columns)[f'MINOR_CNT'].transform('sum')
+            df_new = df_new.loc[(round(df_new[f'MINOR_CNT']/df_new[f'NUM_EMP_ON_{discover}'], decimal_precision)
+                                 <= minor_ratio_max)]
+            df_new.dropna(inplace=True)
+
+            df_new[f'START_DIFF_CNT'] = df.groupby(group_by_columns)[f'START_DIFF_CNT'].transform('sum')
+            df_new = df_new.loc[(round(df_new[f'START_DIFF_CNT']/df_new[f'NUM_EMP_ON_{discover}'], decimal_precision)
+                                 <= start_diff_ratio_max)]
+            df_new.dropna(inplace=True)
+
+            df_new[f'{known}_{discover}_SHARE_NUM'] = df.groupby(
+                group_by_columns)[f'{known}_{discover}_SHARE_NUM'].transform('sum')
+
+            if include_dates:
+                df_new[f'{discover}_MIN_START_DT'] = df_new.groupby(group_by_columns)[f'MIN_START_DT'].transform('min')
+                df_new[f'{discover}_MAX_START_DT'] = df_new.groupby(group_by_columns)[f'MAX_START_DT'].transform('max')
+
+            # Determine how many people have the same discover cd and prefix in the group and calculate related columns
+            if look_for_prefix:
+                group_by_columns = [f'{discover}_POLICY_PREFIX'] + group_by_columns
+
+                df_new[f'NUM_EMP_ON_{discover}_PREFIX'] = df.groupby(group_by_columns)[f'RECORD_COUNT'].transform('sum')
+                df_new = df_new.loc[((df_new[f'NUM_EMP_ON_{discover}_PREFIX'] >= num_emp_on_discover_prefix_min) |
+                                     (df_new[f'{discover}_POLICY_PREFIX'] == ''))]
+                df_new.dropna(inplace=True)
+
+                df_new[f'PREFIX_{known}_{discover}_SHARE_NUM'] = \
+                    df.groupby(group_by_columns)[f'{known}_{discover}_SHARE_NUM'].transform('sum')
+
+                if include_dates:
+                    df_new[f'PREFIX_MIN_START_DT'] = df_new.groupby(group_by_columns)[f'MIN_START_DT'].transform('min')
+                    df_new[f'PREFIX_MAX_START_DT'] = df_new.groupby(group_by_columns)[f'MAX_START_DT'].transform('max')
+
+            # Calculate Percent Columns
+            df_new[f'PER_EMP_ON_{discover}'] = round(100 * df_new[f'NUM_EMP_ON_{discover}'] / df_new[f'NUM_EMP_TOTAL'],
+                                                     decimal_precision)
+            df_new[f'{known}_{discover}_POLICY_SHARE'] = \
+                round(100 * df_new[f'{known}_{discover}_SHARE_NUM'] / df_new[f'NUM_EMP_ON_{discover}'],
+                      decimal_precision)
+
+            if look_for_prefix:
+                df_new[f'PER_EMP_ON_{discover}_PREFIX'] = \
+                    round(100 * df_new[f'NUM_EMP_ON_{discover}_PREFIX'] / df_new[f'NUM_EMP_ON_{discover}'],
+                          decimal_precision)
+                df_new[f'{known}_{discover}_POLICY_SHARE_ON_PREFIX'] = \
+                    round(100 * df_new[f'PREFIX_{known}_{discover}_SHARE_NUM'] / df_new[f'NUM_EMP_ON_{discover}_PREFIX'],
+                          decimal_precision)
+
+            print(f'Size of DataFrame after Calculations & Removals:{df_new.shape}')
+
+            # Create new dataframe that is reordered with only needed columns
+            filter_columns = [f'{discover}_CARRIER_CD', f'{known}_CARRIER_CD',
+                              f'{known}_EMPLOYER', f'{known}_GROUP_NUM', 'INSURED_STATE_CD', 'COLUMN_SELECTION',
+                              'COLUMN_SELECTION_LENGTH', 'COLUMN_SELECTION_PRIORITY', f'NUM_EMP_ON_{discover}',
+                              'NUM_EMP_TOTAL',  f'PER_EMP_ON_{discover}', f'{known}_{discover}_POLICY_SHARE']
+            if include_dates:
+                filter_columns.insert(11, f'{discover}_MIN_START_DT')
+                filter_columns.insert(12, f'{discover}_MAX_START_DT')
+
+            if look_for_prefix:
+                filter_columns.insert(1, f'{discover}_POLICY_PREFIX')
+                filter_columns.insert(11, f'NUM_EMP_ON_{discover}_PREFIX')  # was 9
+                filter_columns.insert(12, f'PER_EMP_ON_{discover}_PREFIX')
+                filter_columns.extend([f'{known}_{discover}_POLICY_SHARE_ON_PREFIX', f'TOP_{discover}_PREFIX'])
+                if include_dates:
+                    filter_columns.insert(14, 'PREFIX_MIN_START_DT')
+                    filter_columns.insert(15, 'PREFIX_MAX_START_DT')
+
+            df_final = df_new.filter(filter_columns, axis=1)
+
+            if look_for_prefix:
+                df_final[f'PER_EMP_ON_{discover}_PREFIX_CEILING'] = \
+                    np.ceil(round(df_final[f'PER_EMP_ON_{discover}_PREFIX'] / 10, decimal_precision))
+                df_final[f'{known}_{discover}_POLICY_SHARE_PREFIX_CEILING'] = \
+                    np.ceil(round(df_final[f'{known}_{discover}_POLICY_SHARE_ON_PREFIX'] / 10, decimal_precision))
+
+            df_final[f'PER_EMP_ON_{discover}_CEILING'] = np.ceil(df_final[f'PER_EMP_ON_{discover}'] / 10)
+            df_final[f'{known}_{discover}_POLICY_SHARE_CEILING'] = \
+                np.ceil(round(df_final[f'{known}_{discover}_POLICY_SHARE'] / 10, decimal_precision))
+
+            df_final[f'{discover}_INFO'] = df_final.apply(next_info, axis=1)
+            if look_for_prefix:
+                df_final[f'PREFIX_INFO'] = df_final.apply(next_info, prefix_info=True, axis=1)
+
+            print(f'Size of DataFrame after group_data_inner:{df_final.shape}')
+
+            return df_final
+
+        def remove_excess(df_removal: pd.DataFrame):
+            # Create list of columns to rank by IN ORDER
+            if look_for_prefix:
+                rank_columns = [f'PER_EMP_ON_{discover}_PREFIX_CEILING', f'PER_EMP_ON_{discover}_CEILING',
+                                f'{known}_{discover}_POLICY_SHARE_PREFIX_CEILING',
+                                f'{known}_{discover}_POLICY_SHARE_CEILING', f'NUM_EMP_ON_{discover}_PREFIX',
+                                f'NUM_EMP_ON_{discover}', 'COLUMN_SELECTION_PRIORITY', 'COLUMN_SELECTION_LENGTH',
+                                f'PER_EMP_ON_{discover}_PREFIX', f'PER_EMP_ON_{discover}',
+                                f'{known}_{discover}_POLICY_SHARE_ON_PREFIX', f'{known}_{discover}_POLICY_SHARE']
+            else:
+                rank_columns = [f'PER_EMP_ON_{discover}_CEILING', f'{known}_{discover}_POLICY_SHARE_CEILING',
+                                f'NUM_EMP_ON_{discover}', 'COLUMN_SELECTION_PRIORITY', 'COLUMN_SELECTION_LENGTH',
+                                f'PER_EMP_ON_{discover}', f'{known}_{discover}_POLICY_SHARE']
+
+            print(f'Size of DataFrame before Ranking Removals:{df_removal.shape}')
+            df_new = multi_col_dense_rank_v4(df=df_removal, rank_columns=rank_columns, rank_name='RANK',
+                                             additional_group_by_col=initial_discover_columns, remove_all_but_best=True)
+            print(f'Size of DataFrame after Ranking Removals:{df_new.shape}')
+
+            return df_new
+
+        def jigsaw_ranks(inner_df: pd.DataFrame):
+            ranked_df = inner_df.copy()
+            df_final = pd.DataFrame()
+
+            labels = [f'{discover}_CARRIER_CD',  f'{known}_CARRIER_CD', f'{known}_EMPLOYER', f'{known}_GROUP_NUM',
+                      'INSURED_STATE_CD', 'NUM_EMP_TOTAL', f'NUM_EMP_ON_{discover}', f'PER_EMP_ON_{discover}',
+                      f'{known}_{discover}_POLICY_SHARE',  f'{discover}_INFO']
+
+            if include_dates:
+                labels.insert(9, f'{discover}_MIN_START_DT')
+                labels.insert(10, f'{discover}_MAX_START_DT')
+
+            if look_for_prefix:
+                rank_list = [f'PREFIX', f'{discover}']
+
+                labels.insert(0, 'RANK_OF_PREFIX')
+                labels.insert(2, f'{discover}_POLICY_PREFIX')
+                labels.insert(11, f'NUM_EMP_ON_{discover}_PREFIX')  # Was 9
+                labels.insert(12, f'PER_EMP_ON_{discover}_PREFIX')
+                labels.insert(13, f'{known}_{discover}_POLICY_SHARE_ON_PREFIX')
+                labels.insert(labels.index(f'{discover}_INFO'), f'TOP_{discover}_PREFIX')
+                labels.insert(labels.index(f'{discover}_INFO'), f'{discover}_POLICY_PREFIX_NEXT')
+                labels.insert(labels.index(f'{discover}_INFO'), f'PREFIX_INFO_NEXT')
+
+                if include_dates:
+                    labels.insert(16, 'PREFIX_MIN_START_DT')
+                    labels.insert(17, 'PREFIX_MAX_START_DT')
+            else:
+                rank_list = [f'{discover}']
+
+            for to_rank in rank_list:
+                if to_rank == 'PREFIX':
+                    rank_name = 'RANK_OF_PREFIX'
+                    col_to_rank = [f'NUM_EMP_ON_{discover}_PREFIX', f'PER_EMP_ON_{discover}_PREFIX',
+                                   f'{known}_{discover}_POLICY_SHARE_ON_PREFIX']
+                    keep_right_col = [f'PREFIX_INFO', f'{discover}_POLICY_PREFIX']
+                    extra_group_by = [f'{discover}_CARRIER_CD']
+                elif to_rank == f'{discover}':
+                    if look_for_prefix:
+                        previous_rank_name = rank_name[:]
+                    rank_name = f'RANK_OF_{discover}'
+                    col_to_rank = [f'NUM_EMP_ON_{discover}', f'PER_EMP_ON_{discover}',
+                                   f'{known}_{discover}_POLICY_SHARE']
+                    if look_for_prefix:
+                        keep_right_col = [f'{discover}_INFO', f'{discover}_CARRIER_CD', f'{discover}_POLICY_PREFIX',
+                                          'RANK_OF_PREFIX']
+                    else:
+                        keep_right_col = [f'{discover}_INFO', f'{discover}_CARRIER_CD']
+                    extra_group_by = []
+                else:
+                    raise TypeError(f"{to_rank} not expected")
+
+                ranked_df = multi_col_dense_rank_v4(df=ranked_df, rank_columns=col_to_rank, rank_name=rank_name,
+                                                    additional_group_by_col=extra_group_by, remove_all_but_best=False)
+                ranked_df[f'NEXT_{rank_name}'] = ranked_df[f'{rank_name}'] + 1
+                left_join_col = initial_group_by_columns + extra_group_by + [f'NEXT_{rank_name}']
+                right_join_col = initial_group_by_columns + extra_group_by + [f'{rank_name}']
+                keep_right_col += right_join_col
+                right_df = ranked_df[keep_right_col].copy()
+
+                if to_rank == 'PREFIX':
+                    jigsaw_df = pd.merge(ranked_df, right_df, left_on=left_join_col, right_on=right_join_col,
+                                         how='left', suffixes=('', '_NEXT'))
+                    df_final = jigsaw_df.filter(labels, axis=1)
+                    df_final.rename(columns={f"{discover}_POLICY_PREFIX_NEXT": f"NEXT_REC_PREFIX",
+                                             "PREFIX_INFO_NEXT": "NEXT_PREFIX_INFO"}, inplace=True)
+                    df_final[rank_name] = df_final[rank_name].astype('int')
+                    ranked_df = df_final.loc[df_final[rank_name] <= 10].copy()
+                elif to_rank == f'{discover}':
+                    labels.insert(0, rank_name)
+                    labels.extend([f'{discover}_CARRIER_CD_NEXT', f'{discover}_INFO_NEXT'])
+                    labels.remove(f'{discover}_INFO')
+
+                    if look_for_prefix:
+                        right_df = right_df.loc[right_df[previous_rank_name] == 1]
+                        jigsaw_df = pd.merge(ranked_df, right_df, left_on=left_join_col, right_on=right_join_col,
+                                             how='left', suffixes=('', '_NEXT'))
+                        labels.remove(f'{discover}_POLICY_PREFIX_NEXT')
+                        labels.insert(labels.index(f'{discover}_CARRIER_CD_NEXT'), 'NEXT_REC_PREFIX')
+                        labels.insert(labels.index(f'{discover}_CARRIER_CD_NEXT'), 'NEXT_PREFIX_INFO')
+                        labels.insert(labels.index(f'{discover}_INFO_NEXT'), f'{discover}_POLICY_PREFIX_NEXT')
+                        df_final = jigsaw_df.filter(labels, axis=1)
+                        df_final.rename(columns={f"{discover}_CARRIER_CD": f"REC_{discover}_CD",
+                                                 f"{discover}_POLICY_PREFIX": "REC_PREFIX",
+                                                 f"{discover}_CARRIER_CD_NEXT": f"NEXT_REC_{discover}",
+                                                 f"{discover}_INFO_NEXT": f"NEXT_{discover}_INFO",
+                                                 f"{discover}_POLICY_PREFIX_NEXT": f"NEXT_REC_{discover}_PREFIX"},
+                                        inplace=True)
+                    else:
+                        jigsaw_df = pd.merge(ranked_df, right_df, left_on=left_join_col, right_on=right_join_col,
+                                             how='left', suffixes=('', '_NEXT'))
+                        df_final = jigsaw_df.filter(labels, axis=1)
+                        df_final.rename(columns={f"{discover}_CARRIER_CD": f"REC_{discover}_CD",
+                                                 f"{discover}_CARRIER_CD_NEXT": f"NEXT_REC_{discover}",
+                                                 f"{discover}_INFO_NEXT": f"NEXT_{discover}_INFO"}, inplace=True)
+                    df_final[rank_name] = df_final[rank_name].astype('int')
+
+            return df_final
+
+        start_time = datetime.datetime.now()
+
+        # Start the new dataframe
+        print('Start Grouping....')
+        grouped_df = pd.DataFrame()
+        for a in tqdm(group_by_combos_list, desc=f'Grouping Process', leave=False):
+            print(f'\nGrouping {a}...')
+            if len(a) == len(initial_group_by_columns):
+                group_data_inner_start_time = datetime.datetime.now()
+                grouped_df = group_data_inner(a)
+                group_data_inner_time = datetime.datetime.now() - group_data_inner_start_time
+            else:
+                # print(f'Grouping: {a}...')
+                group_data_inner_start_time = datetime.datetime.now()
+                grouped_df = pd.concat([grouped_df, group_data_inner(a)], ignore_index=True, axis=0)
+                group_data_inner_time += datetime.datetime.now() - group_data_inner_start_time
+                # print('...Grouped!')
+                grouped_df = remove_excess(grouped_df)
+                # print('...Excess Removed!')
+            print(f'\nCurrent Size of Final DataFrame: {grouped_df.shape}\n')
+        print('All columns grouped!')
+
+        # Rename irrelevant columns based on Column Selection
+        print('\nRemoving irrelevant!')
+        irrelevant_value = f'{empty_str}'
+        grouped_df.loc[~grouped_df[f'COLUMN_SELECTION'].str.contains('C', na=False
+                                                                     ), f'{known}_CARRIER_CD'] = irrelevant_value
+        grouped_df.loc[~grouped_df[f'COLUMN_SELECTION'].str.contains('E', na=False
+                                                                     ), f'{known}_EMPLOYER'] = irrelevant_value
+        grouped_df.loc[~grouped_df[f'COLUMN_SELECTION'].str.contains('G', na=False
+                                                                     ), f'{known}_GROUP_NUM'] = irrelevant_value
+        grouped_df.loc[~grouped_df[f'COLUMN_SELECTION'].str.contains('S', na=False
+                                                                     ), 'INSURED_STATE_CD'] = irrelevant_value
+        print('...Irrelevant Removed!')
+        print(f'{grouped_df.shape}')
+        # Drop unneeded columns and duplicate rows
+        print('\nDrop columns...')
+        if look_for_prefix:
+            grouped_df.drop(columns=[f'COLUMN_SELECTION', 'COLUMN_SELECTION_LENGTH', 'COLUMN_SELECTION_PRIORITY',
+                                     f'PER_EMP_ON_{discover}_CEILING', f'{known}_{discover}_POLICY_SHARE_CEILING',
+                                     f'{known}_{discover}_POLICY_SHARE_PREFIX_CEILING',
+                                     f'PER_EMP_ON_{discover}_PREFIX_CEILING'], inplace=True)
+        else:
+            grouped_df.drop(columns=[f'COLUMN_SELECTION', 'COLUMN_SELECTION_LENGTH', 'COLUMN_SELECTION_PRIORITY',
+                                     f'PER_EMP_ON_{discover}_CEILING', f'{known}_{discover}_POLICY_SHARE_CEILING'],
+                            inplace=True)
+        print(f'{grouped_df.shape}')
+        print(f'\nSize of DataFrame: {grouped_df.shape}\n...drop rows...')
+        grouped_df.drop_duplicates(inplace=True, ignore_index=True)
+        print(f'Dropped\nSize of DataFrame: {grouped_df.shape}\n')
+
+        # Create Recs
+        print(f'\n\nRanking then getting recommendations...')
+        rec_df = jigsaw_ranks(grouped_df)
+        print(f'{rec_df.shape}\nReplace None with Value...')
+        rec_df[f'NEXT_REC_{discover}'] = rec_df[f'NEXT_REC_{discover}'].replace(np.nan, f'{empty_str}')
+        rec_df[f'NEXT_{discover}_INFO'] = rec_df[f'NEXT_{discover}_INFO'].replace(np.nan,
+                                                                                  'NO OTHER SUGGESTION FOR COMBINATION')
+        if look_for_prefix:
+            rec_df[f'NEXT_REC_PREFIX'] = rec_df[f'NEXT_REC_PREFIX'].replace(np.nan, f'{empty_str}')
+            rec_df[f'NEXT_PREFIX_INFO'] = rec_df[f'NEXT_PREFIX_INFO'].replace(np.nan,
+                                                                              'NO OTHER SUGGESTION FOR COMBINATION')
+            rec_df[f'NEXT_REC_{discover}_PREFIX'] = rec_df[f'NEXT_REC_{discover}_PREFIX'].replace(np.nan,
+                                                                                                  f'{empty_str}')
+
+        print(f'\nSize of DataFrame: {rec_df.shape}\n...drop rows...')
+        rec_df.drop_duplicates(inplace=True, ignore_index=True)
+        print(f'\nSize of DataFrame: {rec_df.shape}\nDropped!\nReady to Go!')
+
+        print(f'Group Data with Rank Time: {datetime.datetime.now() - start_time}')
+        print(f'Group Data Inner Time: {group_data_inner_time}')
+
+        return rec_df
+
+    def add_in_gap(df_grouped: pd.DataFrame):
+        df_gap = read_sql_to_df(sql=sql_for_gap_data)
+        df_gap = format_object_as_string(df_gap)
+        print(f'Gap Dataframe:\n{df_gap.shape}\n\n{df_gap}\n\n'
+              f'\nMerge Gap Data with {initial_group_by_columns}...\n'
+              f'Left Data Types: {df_grouped.dtypes}\nRight Data Types:{df_gap.dtypes}\n')
+        df = pd.merge(left=df_grouped, right=df_gap, on=initial_group_by_columns, how='left')
+
+        # Make sure that the newest column is an int column and all blanks are replaced with zero
+        df[df.columns[-1]] = df[df.columns[-1]].replace(np.nan, 0)
+        df[df.columns[-1]] = df[df.columns[-1]].astype('int')
+
+        return df
+
+    def format_sot_table(df: pd.DataFrame):
+        def change_format(row, col_name: str):
+            value = row[col_name]
+            if value == 100:
+                return_value = f"UNEQUIVOCAL: {value:0.0f}%"
+            elif value >= 75:
+                return_value = f"TRUSTWORTHY: {value:0.2f}%"
+            elif value > 50:
+                return_value = f"PLAUSIBLE: {value:0.2f}%"
+            elif value == 50:
+                return_value = f"NECK AND NECK: {value:0.2f}%"  # Fifty-Fifty
+            elif value > 25:
+                return_value = f"FLIMSY: {value:0.2f}%"
+            elif value >= 1:
+                return_value = f"DUBIOUS: {value:0.2f}%"
+            elif value >= 0.01:
+                return_value = f"ABSURD: {value:0.2f}%"
+            else:
+                return_value = f"ABSURD: {value:0.0f}%"
+            return return_value
+
+        column_list = list(df.columns)
+        for col in column_list:
+            if df.dtypes[col] == 'float64':
+                if any(df[col] != df[col].fillna(0).astype(int)) and not df[col].isnull().values.any():
+                    df[col] = df.apply(change_format, col_name=col, axis=1)
+            if df.dtypes[col] == 'object':
+                df[col] = df[col].str.strip()
+        print('Formatting Complete!')
+
+        return df
+
+    ###############################
+    # SQL for Data
+    def sql_for_carriers():
+        if allow_known_to_equal_discover:
+            known_equals_discover_str = ''
+        else:
+            known_equals_discover_str = f"""AND EMP.{discover}_CARRIER_CD <> EMP.{known}_CARRIER_CD"""
+
+        if len(carrier_cd_is_other_dict[discover]) != 0:
+            discover_carrier_cd_str = "Case "
+            for key, value in carrier_cd_is_other_dict[discover].items():
+                discover_carrier_cd_str += f"when EMP.{discover}_CARRIER_CD = '{key}' then '{value}' "
+            discover_carrier_cd_str += f"else EMP.{discover}_CARRIER_CD end as {discover}_CARRIER_CD"
+        else:
+            discover_carrier_cd_str = f"EMP.{discover}_CARRIER_CD"
+
+        print(discover_carrier_cd_str)
+
+        sql_for_emp_discover_carriers = f"""
+        select {discover_carrier_cd_str}, 
+            Count(*) as TOTAL_RECORDS
+        from dl_marshall.employees as EMP
+        Left JOIN 
+            (Select CARRIER_CD, PH_FIRST_NM, PH_LAST_NM, PH_SSN_NUM, PH_DOB_DT, RECIP_FIRST_NM, RECIP_LAST_NM, 
+                RECIP_SSN_NUM, RECIP_DOB_DT, POLICY_START_DT
+            from edw_elg_fl.artfusp
+            WHERE 1=1
+                AND (UPPER(TRIM(POLICY_NUM)) LIKE '%MEDICAID%'
+                OR UPPER(TRIM(EMP_NM)) LIKE ANY ('%MCAID%', '%DSNP%', '%TRIBAL%', '%CHEROKEE%', '%MEDICAID%', '%CHIP%', 
+                    '%MEDICARE%')
+                OR UPPER(TRIM(PLAN_NM)) LIKE ANY ('%MEDICARE%', '%MEDICAI%', '%DSNP%', '%CHIP%', '%MEDADV%', 
+                    '%MED ADV%', '%MMC%', '%HARP%', '%MEDICAID%')
+                OR UPPER(TRIM(GROUP_NUM)) LIKE ANY ('%HCP', '%DSNP', '%MCD%', '%CAID%')
+                OR UPPER(TRIM(GROUP_NUM)) IN ('LABYHP', 'NJFAMCAR', 'NYCDFHP', 'TNDSNP', 'MIPHCP')
+                OR UPPER(TRIM(PLCTP_RF)) IN ('MAMCO', 'MCA', 'MCB', 'MCMCO', 'MCPDP', 'MCSUP', 'CHIP')
+                OR UPPER(TRIM(CARRIER_CD)) LIKE 'MC%')
+            ) as F ON ((EMP.{discover}_CARRIER_CD = F.CARRIER_CD AND EMP.{discover}_COV_START = F.POLICY_START_DT) 
+                    OR (EMP.{known}_CARRIER_CD = F.CARRIER_CD AND EMP.{known}_COV_START = F.POLICY_START_DT)) 
+                AND F.PH_FIRST_NM = EMP.INSURED_FIRST_NM
+                AND F.PH_LAST_NM = EMP.INSURED_LAST_NM
+                AND F.PH_SSN_NUM = EMP.INSURED_SSN_NUM
+                AND F.PH_DOB_DT = EMP.INSURED_BIRTH_DT
+                AND F.RECIP_FIRST_NM = EMP.DEPENDENT_FIRST_NM
+                AND F.RECIP_LAST_NM = EMP.DEPENDENT_LAST_NM
+                AND F.RECIP_SSN_NUM = EMP.DEPENDENT_SSN_NUM
+                AND F.RECIP_DOB_DT = EMP.DEPENDENT_BIRTH_DT
+        where {known}_cov_start is not null and {discover}_cov_start is not null
+            AND (EMP.{discover}_CARRIER_CD IS NOT NULL AND TRIM(EMP.{discover}_CARRIER_CD) <> '' 
+                AND TRIM(EMP.{discover}_CARRIER_CD) <> 'XXXXX')
+            AND (EMP.{known}_CARRIER_CD IS NOT NULL AND TRIM(EMP.{known}_CARRIER_CD) <> '' 
+                AND TRIM(EMP.{known}_CARRIER_CD) <> 'XXXXX')
+            {known_equals_discover_str}
+            AND (F.CARRIER_CD is null AND F.POLICY_START_DT is null AND F.PH_FIRST_NM is null AND F.PH_LAST_NM is null 
+                AND F.PH_SSN_NUM is null AND F.PH_DOB_DT is null AND F.RECIP_FIRST_NM is null 
+                AND F.RECIP_LAST_NM is null AND F.RECIP_SSN_NUM is null 
+                AND F.RECIP_DOB_DT is null) -- Join Conditions Excluded
+        GROUP BY 1
+        --HAVING TOTAL_RECORDS >= {num_emp_on_discover_min}
+        ORDER BY 2 desc,1
+        """
+        return sql_for_emp_discover_carriers
+
+    def sql_for_data(discover_carriers_string: str = ''):
+        if look_for_prefix:
+            prefix_string = f""" case when TO_NUMBER(SUBSTR(oreplace(EMP.{discover}_POLICY_NUM,' ',''),1,3)) is null and 
+                TO_NUMBER(SUBSTR(oreplace(EMP.{discover}_POLICY_NUM,' ',''),1,1)) is null then 
+                SUBSTR(oreplace(EMP.{discover}_POLICY_NUM,' ',''),1,{max_prefix_length})
+                else '' end as {discover}_POLICY_PREFIX,"""
+            prefix_group_by_num = ',6'
+        else:
+            prefix_string = f""" """
+            prefix_group_by_num = ''
+
+        if include_dates:
+            date_string = f""" MIN({known}_COV_START) as MIN_START_DT, MAX({known}_COV_START) as MAX_START_DT,"""
+        else:
+            date_string = ''
+
+        if allow_known_to_equal_discover:
+            known_equals_discover_str = ''
+        else:
+            known_equals_discover_str = f"""AND EMP.{discover}_CARRIER_CD <> EMP.{known}_CARRIER_CD"""
+
+        if len(carrier_cd_is_other_dict[discover]) != 0:
+            discover_carrier_cd_str = "Case "
+            for key, value in carrier_cd_is_other_dict[discover].items():
+                discover_carrier_cd_str += f"when EMP.{discover}_CARRIER_CD = '{key}' then '{value}' "
+            discover_carrier_cd_str += f"else EMP.{discover}_CARRIER_CD end as {discover}_CARRIER_CD"
+        else:
+            discover_carrier_cd_str = f'EMP.{discover}_CARRIER_CD'
+
+        sql_for_emp_data = f"""
+            select {discover_carrier_cd_str}, 
+                EMP.{known}_CARRIER_CD,{prefix_string}
+                CASE WHEN EMP.{known}_EMPLOYER IS NULL OR TRIM(EMP.{known}_EMPLOYER)='' THEN '{no_info_str}' 
+                    ELSE EMP.{known}_EMPLOYER END AS {known}_EMPLOYER, 
+                CASE WHEN EMP.{known}_GROUP_NUM IS NULL OR TRIM(EMP.{known}_GROUP_NUM)='' THEN '{no_info_str}' 
+                    ELSE EMP.{known}_GROUP_NUM END AS {known}_GROUP_NUM,
+                CASE WHEN EMP.INSURED_STATE_CD IS NULL OR TRIM(EMP.INSURED_STATE_CD)='' THEN '{no_info_str}' 
+                    ELSE EMP.INSURED_STATE_CD END AS INSURED_STATE_CD,
+                SUM(case when EMP.patient_relation_to_ins_cd = '01' then 1 else 0 end) as SELF_CNT,
+                SUM(case when cast(EMP.insured_birth_dt as date) <= (current_date - interval '65' year) then 1 
+                    else 0 end) as SENIOR_CNT,
+                SUM(case when cast(EMP.insured_birth_dt as date) >= (current_date - interval '18' year) then 1 
+                    else 0 end) as MINOR_CNT,
+                SUM(case when abs(cast(EMP.{known}_COV_START as date format 'YYYY-MM-DD') - 
+                    cast(EMP.{discover}_COV_START as date format 'YYYY-MM-DD')) > {days_for_cov_start_diff} then 1 
+                    else 0 end) as START_DIFF_CNT,
+                SUM(CASE WHEN EDITDISTANCE(OREPLACE(TRIM(EMP.{discover}_POLICY_NUM),' ',''), 
+                    OREPLACE(TRIM(EMP.{known}_POLICY_NUM),' ','')) <=6 
+                    OR EDITDISTANCE(LEFT(RIGHT(OREPLACE(TRIM(EMP.{discover}_POLICY_NUM),' ',''),11),9), 
+                    LEFT(RIGHT(OREPLACE(TRIM(EMP.{known}_POLICY_NUM),' ',''),11),9)) <= 5 THEN 1 ELSE 0 
+                END) AS {known}_{discover}_SHARE_NUM,{date_string}
+                COUNT(*) as RECORD_COUNT
+            from dl_marshall.employees as EMP
+            Left JOIN 
+                (Select CARRIER_CD, PH_FIRST_NM, PH_LAST_NM, PH_SSN_NUM, PH_DOB_DT, RECIP_FIRST_NM, RECIP_LAST_NM, 
+                    RECIP_SSN_NUM, RECIP_DOB_DT, POLICY_START_DT
+                from edw_elg_fl.artfusp
+                WHERE 1=1
+                    AND (UPPER(TRIM(POLICY_NUM)) LIKE '%MEDICAID%'
+                    OR UPPER(TRIM(EMP_NM)) LIKE ANY ('%MCAID%', '%DSNP%', '%TRIBAL%', '%CHEROKEE%', '%MEDICAID%', 
+                        '%CHIP%', '%MEDICARE%')
+                    OR UPPER(TRIM(PLAN_NM)) LIKE ANY ('%MEDICARE%', '%MEDICAI%', '%DSNP%', '%CHIP%', '%MEDADV%', 
+                        '%MED ADV%', '%MMC%', '%HARP%', '%MEDICAID%')
+                    OR UPPER(TRIM(GROUP_NUM)) LIKE ANY ('%HCP', '%DSNP', '%MCD%', '%CAID%')
+                    OR UPPER(TRIM(GROUP_NUM)) IN ('LABYHP', 'NJFAMCAR', 'NYCDFHP', 'TNDSNP', 'MIPHCP')
+                    OR UPPER(TRIM(PLCTP_RF)) IN ('MAMCO', 'MCA', 'MCB', 'MCMCO', 'MCPDP', 'MCSUP', 'CHIP')
+                    OR UPPER(TRIM(CARRIER_CD)) LIKE 'MC%')
+                ) as F ON ((EMP.{discover}_CARRIER_CD = F.CARRIER_CD AND EMP.{discover}_COV_START = F.POLICY_START_DT) 
+                        OR (EMP.{known}_CARRIER_CD = F.CARRIER_CD AND EMP.{known}_COV_START = F.POLICY_START_DT)) 
+                    AND F.PH_FIRST_NM = EMP.INSURED_FIRST_NM
+                    AND F.PH_LAST_NM = EMP.INSURED_LAST_NM
+                    AND F.PH_SSN_NUM = EMP.INSURED_SSN_NUM
+                    AND F.PH_DOB_DT = EMP.INSURED_BIRTH_DT
+                    AND F.RECIP_FIRST_NM = EMP.DEPENDENT_FIRST_NM
+                    AND F.RECIP_LAST_NM = EMP.DEPENDENT_LAST_NM
+                    AND F.RECIP_SSN_NUM = EMP.DEPENDENT_SSN_NUM
+                    AND F.RECIP_DOB_DT = EMP.DEPENDENT_BIRTH_DT
+            where {known}_cov_start is not null and {discover}_cov_start is not null
+                AND (EMP.{discover}_CARRIER_CD IS NOT NULL 
+                    AND TRIM(EMP.{discover}_CARRIER_CD) <> '' AND TRIM(EMP.{discover}_CARRIER_CD) <> 'XXXXX')
+                AND (EMP.{known}_CARRIER_CD IS NOT NULL 
+                    AND TRIM(EMP.{known}_CARRIER_CD) <> '' AND TRIM(EMP.{known}_CARRIER_CD) <> 'XXXXX')
+                {known_equals_discover_str}
+                AND (F.CARRIER_CD is null AND F.POLICY_START_DT is null 
+                    AND F.PH_FIRST_NM is null AND F.PH_LAST_NM is null 
+                    AND F.PH_SSN_NUM is null AND F.PH_DOB_DT is null 
+                    AND F.RECIP_FIRST_NM is null AND F.RECIP_LAST_NM is null 
+                    AND F.RECIP_SSN_NUM is null AND F.RECIP_DOB_DT is null) -- Join Conditions Excluded
+                AND EMP.{discover}_CARRIER_CD IN ({discover_carriers_string})
+            GROUP BY 1,2,3,4,5{prefix_group_by_num}
+            """
+
+        return sql_for_emp_data
+
+    sql_for_gap_data = f"""
+    WITH GENERAL_POTENTIAL_GAP as
+    (SELECT {known}_CARRIER_CD, 
+        CASE WHEN {known}_EMPLOYER IS NULL OR TRIM({known}_EMPLOYER)='' THEN '{no_info_str}' 
+            ELSE TRIM({known}_EMPLOYER) END AS {known}_EMPLOYER, 
+        CASE WHEN {known}_GROUP_NUM IS NULL OR TRIM({known}_GROUP_NUM)='' THEN '{no_info_str}' 
+            ELSE TRIM({known}_GROUP_NUM) END AS {known}_GROUP_NUM,
+        CASE WHEN INSURED_STATE_CD IS NULL OR TRIM(INSURED_STATE_CD)='' THEN '{no_info_str}' 
+            ELSE TRIM(INSURED_STATE_CD) END AS INSURED_STATE_CD,
+        COUNT(*) AS POTENTIAL_MA_GAP
+    FROM DL_MARSHALL.EMPLOYEES
+    WHERE 1=1
+        and ({discover}_CARRIER_CD IS NULL OR TRIM({discover}_CARRIER_CD) = '')
+        AND ({known}_CARRIER_CD IS NOT NULL AND TRIM({known}_CARRIER_CD) <> '' AND TRIM({known}_CARRIER_CD) <> 'XXXXX')
+        and (trim(MA_NUM) <> '' and MA_NUM is not null)
+    GROUP BY 1,2,3,4
+    )
+    
+    --Layer 1: CARRIER_CD, EMPLOYER, GROUP_NUM, INSURED_STATE_CD
+    SELECT {known}_CARRIER_CD, {known}_EMPLOYER, {known}_GROUP_NUM, INSURED_STATE_CD, POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    
+    --Layer 2: CARRIER_CD, EMPLOYER, GROUP_NUM
+    UNION
+    SELECT {known}_CARRIER_CD, {known}_EMPLOYER, {known}_GROUP_NUM, '{empty_str}' as INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 3: CARRIER_CD, EMPLOYER, INSURED_STATE_CD
+    UNION
+    SELECT {known}_CARRIER_CD, {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 4: CARRIER_CD, GROUP_NUM, INSURED_STATE_CD
+    UNION
+    SELECT {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, {known}_GROUP_NUM, INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 5: EMPLOYER, GROUP_NUM, INSURED_STATE_CD
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, {known}_EMPLOYER, {known}_GROUP_NUM, INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 6: CARRIER_CD, EMPLOYER
+    UNION
+    SELECT {known}_CARRIER_CD, {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, '{empty_str}' as INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 7: CARRIER_CD, INSURED_STATE_CD
+    UNION
+    SELECT {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 8: CARRIER_CD, GROUP_NUM
+    UNION
+    SELECT {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, {known}_GROUP_NUM, '{empty_str}' as INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 9: EMPLOYER, GROUP_NUM
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, {known}_EMPLOYER, {known}_GROUP_NUM, '{empty_str}' as INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 10: EMPLOYER, INSURED_STATE_CD
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 11: GROUP_NUM, INSURED_STATE_CD
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, {known}_GROUP_NUM, INSURED_STATE_CD, 
+        SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 12: CARRIER_CD
+    UNION
+    SELECT {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, 
+        '{empty_str}' as INSURED_STATE_CD, SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 13: EMPLOYER
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, 
+        '{empty_str}' as INSURED_STATE_CD, SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 14: GROUP_NUM
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, {known}_GROUP_NUM, 
+        '{empty_str}' as INSURED_STATE_CD, SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    
+    --Layer 15: INSURED_STATE_CD
+    UNION
+    SELECT '{empty_str}' as {known}_CARRIER_CD, '{empty_str}' as {known}_EMPLOYER, '{empty_str}' as {known}_GROUP_NUM, 
+        INSURED_STATE_CD, SUM(POTENTIAL_MA_GAP) as POTENTIAL_MA_GAP
+    FROM GENERAL_POTENTIAL_GAP
+    GROUP BY 1,2,3,4
+    """
+
+    ###############################
+    # Code for the functions
+    return_dataframe = collect_all_data()
+    print(f'\n\nInitial Dataframe:\n{return_dataframe.shape}')
+    return_dataframe.to_csv(file_path + data_file_name)
+    return_dataframe = group_data_with_rank(return_dataframe)
+    print(f'\nGrouping and Ranking Done!!!\n{return_dataframe.shape}\n\nGet Gap Data...')
+    return_dataframe = add_in_gap(return_dataframe)
+    print(f'Gaps Added!\n{return_dataframe.shape}')
+    return_dataframe = format_sot_table(return_dataframe)
+
+    return return_dataframe
+
+
+###############################
+# Run Script
+# Press the green button in the gutter to run the script.
+file_path = 'C:/Users/plight/OneDrive - Gainwell Technologies/Documents/Data Gap - Employer - Phoebe/'
+file_name = 'SOT_K_P.csv'
+data_file_name = 'SOT_K_P_Starting_Data.csv'
+if __name__ == '__main__':
+    # Code Start Time
+    start = datetime.datetime.now()
+    dt_string = start.strftime("%m/%d/%Y %H:%M:%S.%f")
+    print(f"Start: {dt_string}")
+
+    # Run Code
+    #try:
+    final_dataframe = sot_knowledge_creation(discover='MED', known='RX', look_for_prefix=True, blue_prefix_only=True,
+                                             allow_known_to_equal_discover=False, include_dates=False)
+    pd.set_option('display.max_columns', None)
+    print(f'Dataframe Columns and types\n{final_dataframe.dtypes}\nFinal Dataframe:\n{final_dataframe}'
+          f'\nSending to file...\n{file_path + file_name}')
+    final_dataframe.to_csv(file_path + file_name)
+    print(f'Sent to File!\n\n')
+    #except Exception as error:
+        #print(error)
+
+    # Code End Time
+    end = datetime.datetime.now()
+    dt_string = end.strftime("%m/%d/%Y %H:%M:%S.%f")
+    print(f"Finish: {dt_string}")
+
+    total_time = end - start
+    print(f"Total Time: {total_time}")

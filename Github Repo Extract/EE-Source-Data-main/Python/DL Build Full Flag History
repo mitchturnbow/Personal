@@ -1,0 +1,85 @@
+# Work in Progress
+# Recreating Tableau Data Source through Python, including calculated fields
+# Includes:
+# 	- Appeanding calcuated fields onto end of a Pandas Data Frame
+# 	- How to replicate FIXED calculation and append to DF
+# 	df['New Field Name'] = join.groupby('Fixed Field')['Target Field'].transform('Aggregate Function (min, max, etc)')
+# DB2 SQL Function not currently being used
+# User/Password for SQL Server query function have been removed
+
+import pandas as pd
+import pyodbc
+import datetime
+import os
+import openpyxl
+
+#################### Set Path ####################
+#path = 'C:/Users/plight/OneDrive - Gainwell Technologies/Desktop/Python Reports/'
+path = '//hmsdalfile/general/EE Source Data/Business Integrations/Data Lake Consumption/Python Reports/'
+full_path = path + datetime.datetime.today().strftime('%m-%d-%Y') + '/'
+if not os.path.exists(full_path):
+    os.mkdir(full_path)
+
+flag_file_name = 'DL Flag Info.csv'
+
+### Create History DF ###
+history_column_labels = ['DLFG_REC_INSERT_TIME', 'DLFG_ENTERPRISE_PARTNER_NAME', 'DLFG_GROUP_NAME', 'DLGC_GROUPING_ID',
+                          'DLFG_GROUP_LOADPROCESS', 'DLFC_GROUP_FREQUENCY', 'DLFG_FILE_GROUP_COUNT',
+                          'DLFX_B2B_FILE_PROFILE_NAME', 'EVENT_ID', 'B2B_PARTNER_NAME', 'PROFILE_NAME',
+                          'PARENT_PARTNER_NAME', 'PARENT_PARTNER_ABBR', 'PARENT_PARTNER_CODE', 'CHILD_PARTNER_NAME',
+                          'CHILD_PARTNER_ABBR', 'CHILD_PARTNER_CODE', 'FILE_REC_IN_DTM', 'DEST_FILE_NM',
+                          'Group_File_Status_Nm', 'Group_SLA_Status_Nm', 'Group_Status', 'Unique_Flag_ID',
+                          'Flag_Create_Date', 'Flag_Close_Date', 'Days_In_Issue_Type_1', 'Days_In_Issue_Type_2',
+                          'Days_In_Issue_Type_3', 'Days_In_Issue_Type_4', 'Days_In_Issue_Type_5', 'Total_Days',
+                          'Ticket_Created', 'Flag_Notes']
+history_df = pd.DataFrame(columns=history_column_labels)
+
+### Start Loop ###
+d0 = datetime.date.today()
+d1 = datetime.date(2022, 9, 12)
+delta_1 = d0 - d1
+d2 = datetime.date(2022, 10, 16)
+delta_2 = d0 - d2
+print(delta_1.days)
+n_1 = int(delta_1.days)
+n_original = int(delta_1.days)
+n_end = 0 #int(delta_2.days)
+while n_1 >= n_end:  # 7:
+    try:
+        #################### Load Previous Flag File ####################
+        n_2 = n_1 #1
+        print(n_2)
+        print(n_1)
+        while n_2 != (n_original + 1):
+            try:
+                previous_day = datetime.datetime.today() + datetime.timedelta(days=-n_2)
+                previous_files_full_path = path + previous_day.strftime('%m-%d-%Y') + '/'
+                previous_flag_info_df = pd.read_csv(previous_files_full_path + flag_file_name,index_col=0)
+                print("Previous Files: "+previous_files_full_path+flag_file_name)
+                n_2 = n_original + 1
+            except:
+                n_2 += 1
+
+        previous_flag_info_df.drop_duplicates(inplace=True)
+
+        #Drop Unneeded columns
+        flag_history_slice_df = previous_flag_info_df[history_column_labels].copy()
+        flag_history_slice_df.drop_duplicates(inplace=True)
+
+        #Add to History Dataframe
+        history_df = pd.concat([history_df,flag_history_slice_df])
+        history_df.drop_duplicates(subset=['Unique_Flag_ID','Flag_Create_Date', 'Flag_Notes'],
+                                              keep='last', inplace=True)
+        print("File Added!")
+        n_1 -= 1
+    except:
+        n_1 -= 1
+
+#Full History File
+history_df.reset_index(drop=True, inplace=True)
+history_df.to_csv(path + "Flag History Report Full.csv")
+
+#Latest History File
+history_df.drop_duplicates(subset=['Unique_Flag_ID'], keep='last', inplace=True)
+history_df.reset_index(drop=True, inplace=True)
+history_df.to_csv(path + "Flag History Report Latest.csv")

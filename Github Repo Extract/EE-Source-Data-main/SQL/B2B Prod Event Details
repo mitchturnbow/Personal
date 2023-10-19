@@ -1,0 +1,39 @@
+USE [INFPDX] 
+GO
+
+SELECT  
+e.EVENT_ID, 
+rr.READ_PATTERN_REGEX 'REGEX_PATTERN', 
+SUBSTRING(eb.DESCRIPTION,16,LEN(eb.DESCRIPTION)-16) 'INPUT_FILE_NAME',  
+eep.PROPERTY_VALUE 'FINAL_FILE_NAME', 
+pro.PROFILE_NAME 'B2B_PROFILE', 
+part.PARTNER_NAME 'B2B_PARTNER',
+e.CREATE_TIME,
+e.COMPLETE_TIME,
+eep2.PROPERTY_VALUE 'EVENT_STATUS',
+ep.E_NAME 'B2B_ENDPOINT', 
+ep.FILE_PATH 'LANDING_PATH'
+
+FROM dbo.EVENT AS e  
+LEFT JOIN [dbo].[DX_ENDPOINT_READ_PATTERN] AS rr ON e.PROFILE_ID=rr.PROFILE_ID 
+LEFT JOIN [dbo].[DX_PROFILE] AS pro ON e.PROFILE_ID=pro.PROFILE_ID 
+LEFT JOIN [dbo].[DX_PARTNER] AS part ON pro.PARTNER_ID=part.PARTNER_ID 
+LEFT JOIN [dbo].[EVENT_EVENT_PROPERTIES] eep ON e.EVENT_ID=eep.EVENT_ID 
+LEFT JOIN [dbo].[EVENT_EVENT_PROPERTIES] eep2 ON e.EVENT_ID=eep2.EVENT_ID
+LEFT JOIN [dbo].[DX_EVENT_BLOBS] AS eb ON e.EVENT_ID=eb.EVENT_ID 
+LEFT JOIN [dbo].[DX_ENDPOINT] AS ep ON rr.ENDPOINT_ID = ep.ID 
+
+WHERE 1=1
+AND pro.PROFILE_NAME LIKE '%INBD_%' --To search with B2B Profile Name
+--AND part.PARTNER_NAME LIKE '%%' --To search with B2B Partner Name
+AND pro.PROFILE_NAME NOT LIKE '%Archive%' --To Exclude the general Archive Profile where all client files are stored
+--AND e.EVENT_ID = '1010688088' --To search with B2B Event ID
+AND e.CREATE_TIME >= DATEADD(DAY,-10,CURRENT_TIMESTAMP) --To search within a Timeframe, Note that B2B will often archive after 30 days. If the query is erroring, try to decrease the time span.
+AND eep.PROPERTY_KEY_ID ='1018'  --ALWAYS KEEP ON, Ensures that the Property Field is the File Name
+AND eep2.PROPERTY_KEY_ID = '20011' --ALWAYS KEEP ON; Ensures that the second Property Field is the Event Status
+--AND eep.PROPERTY_VALUE LIKE '%Claim%' -- To search with the Final_File_Name 
+AND eb.DESCRIPTION Like 'Input Message%' --ALWAYS KEEP ON, Ensures that the Description contains the Transport_File_Name@@Unzip_File_Name AKA the Input_File_Name
+--AND eb.DESCRIPTION LIKE '%HMS_IPI%' -- To search with the Input_File_Name 
+AND READ_PATTERN_REGEX LIKE '%^(%' -- Recommend leaving on; Ensures that only 1 Unidentified Profile is showing per Endpoint
+
+ORDER BY CREATE_TIME DESC; 
